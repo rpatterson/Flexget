@@ -1,5 +1,4 @@
 import os
-import re
 from paver.easy import *
 import paver.virtual
 import paver.setuputils
@@ -137,12 +136,16 @@ def clean():
 
 @task
 @cmdopts([
-    ('dist-dir=', 'd', 'directory to put final built distributions in')
+    ('dist-dir=', 'd', 'directory to put final built distributions in'),
+    ('revision=', 'r', 'minor revision number of this build')
 ], share_with=['make_egg'])
 def sdist(options):
     """Build tar.gz distribution package"""
 
-    revision = svn.info().get('last_changed_rev')
+    if not options.sdist.get('revision'):
+        print 'Revision number required.'
+        return
+    revision = options.sdist.pop('revision')
 
     print 'Revision: %s' % revision
 
@@ -162,7 +165,7 @@ def sdist(options):
     for pyc in path('tests/').files('*.pyc'):
         pyc.remove()
 
-    ver = '%sr%s' % (options['version'], revision)
+    ver = '%s.%s' % (options['version'], revision)
 
     print 'Building %s' % ver
 
@@ -183,13 +186,17 @@ def sdist(options):
 
 @task
 @cmdopts([
-    ('dist-dir=', 'd', 'directory to put final built distributions in')
+    ('dist-dir=', 'd', 'directory to put final built distributions in'),
+    ('revision=', 'r', 'minor revision number of this build')
 ], share_with=['sdist'])
 def make_egg(options):
     # naming this task to bdist_egg will make egg installation fail
 
-    revision = svn.info().get('last_changed_rev')
-    ver = '%sr%s' % (options['version'], revision)
+    if not options.make_egg.get('revision'):
+        print 'Revision number required.'
+        return
+    revision = options.make_egg.revision
+    ver = '%s.%s' % (options['version'], revision)
 
     # hack version number into setup( ... options='1.0-svn' ...)
     from paver import tasks
