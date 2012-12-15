@@ -1900,6 +1900,7 @@ def adjust_options(options, args):
 
 
     options.no_site_packages = False
+    options.use_distribute = True
     if hasattr(options,"system_site_packages"):
         options.system_site_packages = True
         
