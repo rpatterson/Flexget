@@ -1900,7 +1900,6 @@ def adjust_options(options, args):
 
 
     options.no_site_packages = False
-    options.use_distribute = True
     if hasattr(options,"system_site_packages"):
         options.system_site_packages = True
         
@@ -1913,6 +1912,13 @@ def after_install(options, home_dir):
         bin_dir = join(home_dir, 'bin')
     subprocess.call([join(bin_dir, 'easy_install'), 'paver==1.1.1'])
     subprocess.call([join(bin_dir, 'paver'),'develop'])
+def more_adjust_options(orig_adjust_options):
+    def adjust_options(options, args):
+        orig_adjust_options(options, args)
+        options.use_distribute = True
+    return adjust_options
+adjust_options = more_adjust_options(adjust_options)
+
 
 def convert(s):
     b = base64.b64decode(s.encode('ascii'))
