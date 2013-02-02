@@ -8,7 +8,11 @@ from flexget.plugin import register_plugin, priority
 log = logging.getLogger('torrent_cache')
 
 MIRRORS = ['http://torrage.com/torrent/',
-           'https://torcache.net/torrent/']
+           # Now using a landing page instead of going directly to the torrent
+           # TODO: May be fixable by setting the referer
+           #'http://torcache.net/torrent/',
+           #'http://zoink.it/torrent/',
+           'http://torrage.ws/torrent/']
 
 
 class TorrentCache(object):
