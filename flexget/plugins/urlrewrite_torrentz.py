@@ -4,6 +4,7 @@ import re
 import urllib
 import urllib2
 import feedparser
+import random
 
 from flexget.plugin import register_plugin, PluginWarning
 from flexget.entry import Entry
