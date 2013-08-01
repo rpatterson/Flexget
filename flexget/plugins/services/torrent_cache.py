@@ -4,13 +4,10 @@ import re
 import random
 
 from flexget.plugin import register_plugin, priority
+from flexget.utils.bittorrent import MIRRORS
+
 
 log = logging.getLogger('torrent_cache')
-
-MIRRORS = ['http://torrage.com/torrent/',
-           'http://torcache.net/torrent/',
-           #'http://zoink.it/torrent/',
-           'http://torrage.ws/torrent/']
 
 
 class TorrentCache(object):

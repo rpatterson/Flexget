@@ -9,6 +9,7 @@ import random
 from flexget.plugin import register_plugin, PluginWarning
 from flexget.entry import Entry
 from flexget.utils.search import torrent_availability, normalize_unicode
+from flexget.utils.bittorrent import MIRRORS
 from flexget import validator
 
 log = logging.getLogger('torrentz')
@@ -34,10 +35,8 @@ class UrlRewriteTorrentz(object):
         return REGEXP.match(entry['url'])
 
     def url_rewrite(self, task, entry):
-        from flexget.plugins.services import torrent_cache
         thash = REGEXP.match(entry['url']).group(1)
-        entry['url'] = '%s%s.torrent' % (
-            random.choice(torrent_cache.MIRRORS), thash.upper())
+        entry['url'] = '%s%s.torrent' % (random.choice(MIRRORS), thash.upper())
         entry['torrent_info_hash'] = thash
 
     def search(self, entry, config=None):

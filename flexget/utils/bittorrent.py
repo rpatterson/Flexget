@@ -30,6 +30,13 @@ METAFILE_STD_KEYS = [i.split('.') for i in (
     "info.files.path",
 )]
 
+MIRRORS = [
+    'http://torrage.com/torrent/',
+    'https://torcache.net/torrent/',
+    'http://zoink.it/torrent/',
+    'http://torrage.ws/torrent/'
+    ]
+
 
 def clean_meta(meta, including_info=False, logger=None):
     """ Clean meta dict. Optionally log changes using the given logger.
