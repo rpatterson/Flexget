@@ -155,7 +155,7 @@ class TestQuality(FlexGetBase):
 class TestDatabase(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             series:
               - some series
@@ -253,6 +253,7 @@ class TestFilterSeries(FlexGetBase):
             - title: many.names.S01E01
             - title: name.1.S01E02
             - title: name.2.S01E03
+            - title: paren.title.2013.S01E01
             series:
             - The Show:
                 alternate_name: Other Name
@@ -260,6 +261,8 @@ class TestFilterSeries(FlexGetBase):
                 alternate_name:
                 - name 1
                 - name 2
+            - paren title (US):
+                alternate_name: paren title 2013
     """
 
     def test_smoke(self):
@@ -347,6 +350,20 @@ class TestEpisodeAdvancement(FlexGetBase):
             series:
               - backwards
 
+          test_backwards_okay_1:
+            mock:
+              - {title: 'backwards s01e02'}
+            series:
+              - backwards:
+                  tracking: backfill
+
+          test_backwards_okay_2:
+            mock:
+              - {title: 'backwards s01e03'}
+            series:
+              - backwards:
+                  tracking: no
+
           test_forwards_1:
             mock:
               - {title: 'forwards s01e01'}
@@ -376,6 +393,13 @@ class TestEpisodeAdvancement(FlexGetBase):
               - {title: 'forwards s05e01'}
             series:
               - forwards
+
+          test_forwards_okay_1:
+            mock:
+              - {title: 'forwards s05e01'}
+            series:
+              - forwards:
+                  tracking: no
 
           test_unordered:
             mock:
@@ -430,6 +454,12 @@ class TestEpisodeAdvancement(FlexGetBase):
         self.execute_task('test_backwards_3')
         assert self.task.find_entry('rejected', title='backwards s01e01'), \
             'backwards s01e01 should have been rejected, in previous season'
+        self.execute_task('test_backwards_okay_1')
+        assert self.task.find_entry('accepted', title='backwards s01e02'), \
+            'backwards s01e01 should have been accepted, backfill enabled'
+        self.execute_task('test_backwards_okay_2')
+        assert self.task.find_entry('accepted', title='backwards s01e03'), \
+            'backwards s01e01 should have been accepted, tracking off'
 
     def test_forwards(self):
         """Series plugin: episode advancement (future)"""
@@ -444,10 +474,13 @@ class TestEpisodeAdvancement(FlexGetBase):
             'forwards s03e01 should have been accepted'
         self.execute_task('test_forwards_4')
         assert self.task.find_entry('rejected', title='forwards s04e02'),\
-        'forwards s04e02 should have been rejected'
+            'forwards s04e02 should have been rejected'
         self.execute_task('test_forwards_5')
         assert self.task.find_entry('rejected', title='forwards s05e01'), \
             'forwards s05e01 should have been rejected'
+        self.execute_task('test_forwards_okay_1')
+        assert self.task.find_entry('accepted', title='forwards s05e01'), \
+            'forwards s05e01 should have been accepted with tracking turned off'
 
     def test_unordered(self):
         """Series plugin: unordered episode advancement"""
@@ -504,7 +537,7 @@ class TestFilterSeriesPriority(FlexGetBase):
 class TestPropers(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             # prevents seen from rejecting on second execution,
             # we want to see that series is able to reject
@@ -752,7 +785,7 @@ class TestDuplicates(FlexGetBase):
 
     __yaml__ = """
 
-        presets:
+        templates:
           global: # just cleans log a bit ..
             disable_builtins:
               - seen
@@ -826,7 +859,7 @@ class TestDuplicates(FlexGetBase):
 class TestQualities(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             disable_builtins: yes
             series:
@@ -966,7 +999,7 @@ class TestQualities(FlexGetBase):
 class TestIdioticNumbering(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             series:
               - FooBar:
@@ -1037,7 +1070,7 @@ class TestNormalization(FlexGetBase):
 class TestMixedNumbering(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             series:
               - FooBar:
@@ -1111,7 +1144,7 @@ class TestExact(FlexGetBase):
 class TestTimeframe(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             series:
               - test:
@@ -1369,29 +1402,29 @@ class TestFromGroup(FlexGetBase):
         assert self.task.find_entry('accepted', title='Test.14.HDTV-Name')
 
 
-class TestWatched(FlexGetBase):
+class TestBegin(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           eps:
             mock:
               - {title: 'WTest.S02E03.HDTV.XViD-FlexGet'}
               - {title: 'W2Test.S02E03.HDTV.XViD-FlexGet'}
         tasks:
           before_ep_test:
-            preset: eps
+            template: eps
             series:
               - WTest:
                   begin: S02E05
               - W2Test:
                   begin: S03E02
           after_ep_test:
-            preset: eps
+            template: eps
             series:
               - WTest:
                   begin: S02E03
               - W2Test:
-                  begin: S01E04
+                  begin: S02E01
           before_seq_test:
             mock:
             - title: WTest.1.HDTV.XViD-FlexGet
@@ -1428,6 +1461,22 @@ class TestWatched(FlexGetBase):
                   begin: '2009-05-05'
               - W2Test:
                   begin: '2012-12-31'
+          test_advancement1:
+            mock:
+            - title: WTest.S01E01
+            series:
+            - WTest
+          test_advancement2:
+            mock:
+            - title: WTest.S03E01
+            series:
+            - WTest
+          test_advancement3:
+            mock:
+            - title: WTest.S03E01
+            series:
+            - WTest:
+                begin: S03E01
 
     """
 
@@ -1455,11 +1504,22 @@ class TestWatched(FlexGetBase):
         self.execute_task('after_date_test')
         assert len(self.task.accepted) == 2, 'Entries should have been accepted, they are not before the begin episode'
 
+    def test_advancement(self):
+        # Put S01E01 into the database as latest download
+        self.execute_task('test_advancement1')
+        assert self.task.accepted
+        # Just verify regular ep advancement would block S03E01
+        self.execute_task('test_advancement2')
+        assert not self.task.accepted, 'Episode advancement should have blocked'
+        # Make sure ep advancement doesn't block it when we've set begin to that ep
+        self.execute_task('test_advancement3')
+        assert self.task.accepted, 'Episode should have been accepted'
+
 
 class TestSeriesPremiere(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             metainfo_series: yes
             series_premiere: yes
@@ -1485,7 +1545,7 @@ class TestImportSeries(FlexGetBase):
     __yaml__ = """
         tasks:
           timeframe_max:
-            import_series:
+            configure_series:
               settings:
                 propers: 12 hours
                 target: 720p
@@ -1497,10 +1557,17 @@ class TestImportSeries(FlexGetBase):
             mock:
               - title: the show s03e02 1080p bluray
               - title: the show s03e02 hdtv
+          test_import_altnames:
+            configure_series:
+              from:
+                mock:
+                  - {title: 'the show', configure_series_alternate_name: 'le show'}
+            mock:
+              - title: le show s03e03
     """
 
     def test_timeframe_max(self):
-        """Tests import_series as well as timeframe with max_quality."""
+        """Tests configure_series as well as timeframe with max_quality."""
         self.execute_task('timeframe_max')
         assert not self.task.accepted, 'Entry shouldnot have been accepted on first run.'
         age_series(minutes=6)
@@ -1508,6 +1575,12 @@ class TestImportSeries(FlexGetBase):
         assert self.task.find_entry('accepted', title='the show s03e02 hdtv'), \
                 'hdtv should have been accepted after timeframe.'
 
+    def test_import_altnames(self):
+        """Tests configure_series with alternate_name."""
+        self.execute_task('test_import_altnames')
+        entry = self.task.find_entry(title='le show s03e03')
+        assert entry.accepted, 'entry matching series alternate name should have been accepted.'
+        assert entry['series_name'] == 'the show', 'entry series should be set to the main name'
 
 class TestIDTypes(FlexGetBase):
 
@@ -1518,7 +1591,8 @@ class TestIDTypes(FlexGetBase):
               - episode
               - date
               - sequence
-              - stupid id
+              - stupid id:
+                  id_regexp: (\\dcat)
             mock:
               - title: episode S03E04
               - title: episode 3x05
@@ -1526,7 +1600,7 @@ class TestIDTypes(FlexGetBase):
               - title: date 4.5.11
               - title: sequence 003
               - title: sequence 4
-              - title: stupid id 2008x3.5
+              - title: stupid id 3cat
     """
 
     def test_id_types(self):
@@ -1576,7 +1650,7 @@ class TestInvalidSeries(FlexGetBase):
     def test_blank_series(self):
         """Make sure a blank series doesn't crash."""
         self.execute_task('blank')
-        assert not self.task._abort, 'Task should not have aborted'
+        assert not self.task.aborted, 'Task should not have aborted'
 
 
 class TestDoubleEps(FlexGetBase):
@@ -1620,7 +1694,7 @@ class TestDoubleEps(FlexGetBase):
 
 class TestAutoLockin(FlexGetBase):
     __yaml__ = """
-        presets:
+        templates:
           global:
             series:
             - FooBar
@@ -1666,3 +1740,81 @@ class TestAutoLockin(FlexGetBase):
         assert len(self.task.accepted) == 4, 'All specials should have been accepted'
         self.execute_task('try_reg')
         assert len(self.task.accepted) == 2, 'Specials should not have caused episode type lock-in'
+
+
+class TestReruns(FlexGetBase):
+    __yaml__ = """
+        tasks:
+          one_accept:
+            mock:
+            - title: the show s01e01
+            - title: the show s01e01 different
+            series:
+            - the show
+            rerun: 2
+            mock_output: yes
+    """
+
+    def test_one_accept(self):
+        self.execute_task('one_accept')
+        assert len(self.task.mock_output) == 1, \
+            'should have accepted once!: %s' % ', '.join(e['title'] for e in self.task.mock_output)
+
+
+class TestSpecials(FlexGetBase):
+    __yaml__ = """
+        tasks:
+          preferspecials:
+            mock:
+            - title: the show s03e04 special
+            series:
+            - the show:
+                prefer_specials: True
+
+          nopreferspecials:
+            mock:
+            - title: the show s03e05 special
+            series:
+            - the show:
+                prefer_specials: False
+
+          assumespecial:
+            mock:
+            - title: the show SOMETHING
+            series:
+            - the show:
+                assume_special: True
+
+          noassumespecial:
+            mock:
+            - title: the show SOMETHING
+            series:
+            - the show:
+                assume_special: False
+    """
+
+    def test_prefer_specials(self):
+        #Test that an entry matching both ep and special is flagged as a special when prefer_specials is True
+        self.execute_task('preferspecials')
+        entry = self.task.find_entry('accepted', title='the show s03e04 special')
+        assert entry.get('series_id_type') == 'special', 'Entry which should have been flagged a special was not.'
+
+    def test_not_prefer_specials(self):
+        #Test that an entry matching both ep and special is flagged as an ep when prefer_specials is False
+        self.execute_task('nopreferspecials')
+        entry = self.task.find_entry('accepted', title='the show s03e05 special')
+        assert entry.get('series_id_type') != 'special', 'Entry which should not have been flagged a special was.'
+
+    def test_assume_special(self):
+        #Test that an entry with no ID found gets flagged as a special and accepted if assume_special is True
+        self.execute_task('assumespecial')
+        entry = self.task.find_entry(title='the show SOMETHING')
+        assert entry.get('series_id_type') == 'special', 'Entry which should have been flagged as a special was not.'
+        assert entry.accepted, 'Entry which should have been accepted was not.'
+
+    def test_not_assume_special(self):
+        #Test that an entry with no ID found does not get flagged as a special and accepted if assume_special is False
+        self.execute_task('noassumespecial')
+        entry = self.task.find_entry(title='the show SOMETHING')
+        assert entry.get('series_id_type') != 'special', 'Entry which should not have been flagged as a special was.'
+        assert not entry.accepted, 'Entry which should not have been accepted was.'

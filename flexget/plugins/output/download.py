@@ -4,6 +4,7 @@ import logging
 import mimetypes
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import urllib
@@ -13,7 +14,8 @@ from httplib import BadStatusLine
 
 from requests import RequestException
 
-from flexget.plugin import register_plugin, register_parser_option, PluginWarning, PluginError
+from flexget import options, plugin
+from flexget.event import event
 from flexget.utils.tools import decode_html
 from flexget.utils.template import RenderError
 from flexget.utils.pathscrub import pathscrub
@@ -84,7 +86,7 @@ class PluginDownload(object):
 
         # set temporary download path based on user's config setting or use fallback
         tmp = config.get('temp', os.path.join(task.manager.config_base, 'temp'))
-        
+
         self.get_temp_files(task, require_path=config.get('require_path', False), fail_html=config['fail_html'],
                             tmp_path=tmp)
 
@@ -145,7 +147,7 @@ class PluginDownload(object):
                 log.error('%s can\'t be downloaded, no path specified for entry' % entry['title'])
                 entry.fail('no path specified for entry')
             else:
-                entry.fail(", ".join(errors))
+                entry.fail(', '.join(errors))
 
     def save_error_page(self, entry, task, page):
         received = os.path.join(task.manager.config_base, 'received', task.name)
@@ -186,7 +188,7 @@ class PluginDownload(object):
         :return: String error, if failed.
         """
         try:
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Would download: %s' % entry['title'])
             else:
                 if not task.manager.unit_test:
@@ -195,7 +197,7 @@ class PluginDownload(object):
         except RequestException as e:
             # TODO: Improve this error message?
             log.warning('RequestException %s' % e)
-            return 'Request Exception'
+            return 'Network error during request: %s' % e
         # TODO: I think these exceptions will not be thrown by requests library.
         except urllib2.HTTPError as e:
             log.warning('HTTPError %s' % e.code)
@@ -235,18 +237,17 @@ class PluginDownload(object):
             log.debug('URL for `%s` could not be encoded in latin1' % entry['title'])
             try:
                 url = url.encode('utf-8')
-            except:
+            except Exception:
                 log.warning('Unable to URL-encode URL for `%s`' % entry['title'])
         if not isinstance(url, unicode):
-            url = urllib.quote(url, safe=b':/~?=&%')
+            url = urllib.quote(url, safe=b':/~?=&%;')
         log.debug('Downloading url \'%s\'' % url)
 
         # get content
         auth = None
-        if 'basic_auth_password' in entry and 'basic_auth_username' in entry:
-            log.debug('Basic auth enabled. User: %s Password: %s'
-                      % (entry['basic_auth_username'], entry['basic_auth_password']))
-            auth = (entry['basic_auth_username'], entry['basic_auth_password'])
+        if 'download_auth' in entry:
+            auth = entry['download_auth']
+            log.debug('Custom auth enabled for %s download: %s' % (entry['title'], entry['download_auth']))
 
         response = task.requests.get(url, auth=auth, raise_status=False)
         if response.status_code != 200:
@@ -273,10 +274,10 @@ class PluginDownload(object):
         if not os.path.isdir(tmp_path):
             log.debug('creating tmp_path %s' % tmp_path)
             os.mkdir(tmp_path)
-        
+
         # check for write-access
         if not os.access(tmp_path, os.W_OK):
-            raise PluginError('Not allowed to write to temp directory `%s`' % tmp_path)
+            raise plugin.PluginError('Not allowed to write to temp directory `%s`' % tmp_path)
 
         # download and write data into a temp file
         tmp_dir = tempfile.mkdtemp(dir=tmp_path)
@@ -286,13 +287,16 @@ class PluginDownload(object):
         try:
             for chunk in response.iter_content(chunk_size=150 * 1024, decode_unicode=False):
                 outfile.write(chunk)
-        except:
+        except Exception as e:
             # don't leave futile files behind
             # outfile has to be closed before we can delete it on Windows
             outfile.close()
             log.debug('Download interrupted, removing datafile')
             os.remove(datafile)
-            raise
+            if isinstance(e, socket.timeout):
+                log.error('Timeout while downloading file')
+            else:
+                raise
         else:
             outfile.close()
             # Do a sanity check on downloaded file
@@ -305,7 +309,10 @@ class PluginDownload(object):
             entry['file'] = datafile
             log.debug('%s field file set to: %s' % (entry['title'], entry['file']))
 
-        entry['mime-type'] = parse_header(response.headers['content-type'])[0]
+        if 'content-type' in response.headers:
+            entry['mime-type'] = parse_header(response.headers['content-type'])[0]
+        else:
+            entry['mime-type'] = "unknown/unknown"
 
         content_encoding = response.headers.get('content-encoding', '')
         decompress = 'gzip' in content_encoding or 'deflate' in content_encoding
@@ -319,7 +326,12 @@ class PluginDownload(object):
         else:
             log.info('Content-disposition disabled for %s' % entry['title'])
         self.filename_ext_from_mime(entry)
-        # TODO: LAST resort, try to scrap url for filename?
+
+        if not entry.get('filename'):
+            filename = os.path.basename(url)
+            log.debug('No filename - setting from url: %s' % filename)
+            entry['filename'] = filename
+        log.debug('Finishing download_entry() with filename %s' % entry.get('filename'))
 
     def filename_from_headers(self, entry, response):
         """Checks entry filename if it's found from content-disposition"""
@@ -368,7 +380,7 @@ class PluginDownload(object):
         for entry in task.accepted:
             try:
                 self.output(task, entry, config)
-            except PluginWarning as e:
+            except plugin.PluginWarning as e:
                 entry.fail()
                 log.error('Plugin error while writing: %s' % e)
             except Exception as e:
@@ -382,19 +394,19 @@ class PluginDownload(object):
             PluginError if operation fails
         """
 
-        if 'file' not in entry and not task.manager.options.test:
+        if 'file' not in entry and not task.options.test:
             log.debug('file missing, entry: %s' % entry)
-            raise PluginError('Entry `%s` has no temp file associated with' % entry['title'])
+            raise plugin.PluginError('Entry `%s` has no temp file associated with' % entry['title'])
 
         try:
             # use path from entry if has one, otherwise use from download definition parameter
             path = entry.get('path', config.get('path'))
             if not isinstance(path, basestring):
-                raise PluginError('Invalid `path` in entry `%s`' % entry['title'])
+                raise plugin.PluginError('Invalid `path` in entry `%s`' % entry['title'])
 
             # override path from command line parameter
-            if task.manager.options.dl_path:
-                path = task.manager.options.dl_path
+            if task.options.dl_path:
+                path = task.options.dl_path
 
             # expand variables in path
             try:
@@ -407,7 +419,7 @@ class PluginDownload(object):
             path = pathscrub(path)
 
             # If we are in test mode, report and return
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Would write `%s` to `%s`' % (entry['title'], path))
                 # Set a fake location, so the exec plugin can do string replacement during --test #1015
                 entry['output'] = os.path.join(path, 'TEST_MODE_NO_OUTPUT')
@@ -419,12 +431,12 @@ class PluginDownload(object):
                 try:
                     os.makedirs(path)
                 except:
-                    raise PluginError('Cannot create path %s' % path, log)
+                    raise plugin.PluginError('Cannot create path %s' % path, log)
 
             # check that temp file is present
             if not os.path.exists(entry['file']):
                 log.debug('entry: %s' % entry)
-                raise PluginWarning('Downloaded temp file `%s` doesn\'t exist!?' % entry['file'])
+                raise plugin.PluginWarning('Downloaded temp file `%s` doesn\'t exist!?' % entry['file'])
 
             # if we still don't have a filename, try making one from title (last resort)
             if not entry.get('filename'):
@@ -472,7 +484,7 @@ class PluginDownload(object):
                     # ignore permission errors, see ticket #555
                     import errno
                     if not os.path.exists(destfile):
-                        raise PluginError('Unable to write %s' % destfile)
+                        raise plugin.PluginError('Unable to write %s' % destfile)
                     if err.errno != errno.EPERM:
                         raise
 
@@ -482,8 +494,8 @@ class PluginDownload(object):
         finally:
             self.cleanup_temp_file(entry)
 
-    def on_task_exit(self, task, config):
-        """Make sure all temp files are cleaned up when task exits"""
+    def on_task_learn(self, task, config):
+        """Make sure all temp files are cleaned up after output phase"""
         self.cleanup_temp_files(task)
 
     def on_task_abort(self, task, config):
@@ -503,6 +515,13 @@ class PluginDownload(object):
         for entry in task.entries + task.rejected + task.failed:
             self.cleanup_temp_file(entry)
 
-register_plugin(PluginDownload, 'download', api_ver=2)
-register_parser_option('--dl-path', action='store', dest='dl_path', default=False,
-                       metavar='PATH', help='Override path for download plugin. Applies to all executed tasks.')
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(PluginDownload, 'download', api_ver=2)
+
+
+@event('options.register')
+def register_parser_arguments():
+    options.get_parser('execute').add_argument('--dl-path', dest='dl_path', default=False, metavar='PATH',
+                                               help='override path for download plugin, applies to all executed tasks')

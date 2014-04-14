@@ -2,19 +2,22 @@ from __future__ import unicode_literals, division, absolute_import
 import re
 import urllib
 import logging
-from flexget.plugins.plugin_urlrewriting import UrlRewritingError
+
+from flexget import plugin
+from flexget.config_schema import one_or_more
 from flexget.entry import Entry
-from flexget.plugin import register_plugin, internet, PluginWarning
+from flexget.event import event
+from flexget.plugins.plugin_urlrewriting import UrlRewritingError
 from flexget.utils import requests
 from flexget.utils.soup import get_soup
 from flexget.utils.search import torrent_availability, normalize_unicode
-from flexget import validator
-from flexget.utils.tools import urlopener
 
 log = logging.getLogger('torrentleech')
 
 CATEGORIES = {
     'all': 0,
+
+    # Movies
     'Cam': 8,
     'TS': 9,
     'R5': 10,
@@ -22,8 +25,13 @@ CATEGORIES = {
     'DVDR': 12,
     'HD': 13,
     'BDRip': 14,
-    'Boxsets': 15,
-    'Documentaries': 29
+    'Movie Boxsets': 15,
+    'Documentaries': 29,
+
+    #TV
+    'Episodes': 26,
+    'TV Boxsets': 27,
+    'Episodes HD': 32
 }
 
 
@@ -37,21 +45,26 @@ class UrlRewriteTorrentleech(object):
           password: xxxxxxxx  (required)
           category: HD
 
-          Category is any of: all, Cam, TS, R5, DVDRip,
-          DVDR, HD, BDRip, Boxsets, Documentaries
+          Category is any combination of: all, Cam, TS, R5,
+          DVDRip, DVDR, HD, BDRip, Movie Boxsets, Documentaries,
+          Episodes, TV BoxSets, Episodes HD
     """
 
-    def validator(self):
-        root = validator.factory()
-        advanced = root.accept('dict')
-        advanced.accept('text', key='rss_key', required=True)
-        advanced.accept('text', key='username', required=True)
-        advanced.accept('text', key='password', required=True)
-        advanced.accept('choice', key='category').accept_choices(CATEGORIES)
-        advanced.accept('integer', key='category')
-        # advanced.accept('text', key='cookie', required=True)
-        # advanced.accept('boolean', key='sort_reverse')
-        return root
+    schema = {
+        'type': 'object',
+        'properties': {
+            'rss_key': {'type': 'string'},
+            'username': {'type': 'string'},
+            'password': {'type': 'string'},
+            'category': one_or_more({
+                'oneOf': [
+                    {'type': 'integer'},
+                    {'type': 'string', 'enum': list(CATEGORIES)},
+            ]}),
+        },
+        'required': ['rss_key', 'username', 'password'],
+        'additionalProperties': False
+    }
 
     # urlrewriter API
     def url_rewritable(self, task, entry):
@@ -76,7 +89,7 @@ class UrlRewriteTorrentleech(object):
             # TODO: Search doesn't enforce close match to title, be more picky
             entry['url'] = results[0]['url']
 
-    @internet(log)
+    @plugin.internet(log)
     def search(self, entry, config=None):
         """
         Search for name from torrentleech.
@@ -93,11 +106,13 @@ class UrlRewriteTorrentleech(object):
         # sort = SORT.get(config.get('sort_by', 'seeds'))
         # if config.get('sort_reverse'):
             # sort += 1
-        if isinstance(config.get('category'), int):
-            category = config['category']
-        else:
-            category = CATEGORIES.get(config.get('category', 'all'))
-        filter_url = '/categories/%d' % category
+        categories = config.get('category', 'all')
+        # Make sure categories is a list
+        if not isinstance(categories, list):
+            categories = [categories]
+        # If there are any text categories, turn them into their id number
+        categories = [c if isinstance(c, int) else CATEGORIES[c] for c in categories]
+        filter_url = '/categories/%s' % ','.join(str(c) for c in categories)
         entries = set()
         for search_string in entry.get('search_strings', [entry['title']]):
             query = normalize_unicode(search_string)
@@ -148,4 +163,6 @@ class UrlRewriteTorrentleech(object):
 
         return sorted(entries, reverse=True, key=lambda x: x.get('search_sort'))
 
-register_plugin(UrlRewriteTorrentleech, 'torrentleech', groups=['urlrewriter', 'search'])
+@event('plugin.register')
+def register_plugin():
+    plugin.register(UrlRewriteTorrentleech, 'torrentleech', groups=['urlrewriter', 'search'], api_ver=2)

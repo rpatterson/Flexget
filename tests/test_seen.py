@@ -5,7 +5,7 @@ from tests import FlexGetBase
 class TestFilterSeen(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             accept_all: true
 
@@ -24,6 +24,12 @@ class TestFilterSeen(FlexGetBase):
             mock:
               - {title: 'New title 1', url: 'http://localhost/new1', imdb_score: 5}
               - {title: 'New title 2', url: 'http://localhost/new2', imdb_score: 5}
+
+          test_learn:
+            mock:
+            - title: learned entry
+            accept_all: yes
+            mock_output: yes
     """
 
     def test_seen(self):
@@ -47,11 +53,17 @@ class TestFilterSeen(FlexGetBase):
         assert self.task.find_entry(title='New title 1') and self.task.find_entry(title='New title 2'), \
             'Item should not have been rejected because of number field'
 
+    def test_learn(self):
+        self.execute_task('test_learn', options={'learn': True})
+        assert len(self.task.accepted) == 1, 'entry should have been accepted'
+        assert not self.task.mock_output, 'Entry should not have been output with --learn'
+        self.execute_task('test_learn')
+        assert len(self.task.rejected) == 1, 'Seen plugin should have rejected on second run'
 
 class TestSeenLocal(FlexGetBase):
 
     __yaml__ = """
-      presets:
+      templates:
         global:
           accept_all: yes
       tasks:

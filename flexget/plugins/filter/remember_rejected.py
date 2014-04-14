@@ -1,13 +1,15 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
 from datetime import datetime, timedelta
+
 from sqlalchemy import Column, Integer, String, Unicode, DateTime, ForeignKey, and_, Index
 from sqlalchemy.orm import relation
-from flexget import db_schema
+
+from flexget import db_schema, options, plugin
 from flexget.event import event
-from flexget.plugin import register_plugin, register_parser_option, priority
+from flexget.manager import Session
 from flexget.utils.sqlalchemy_utils import table_columns, drop_tables, table_add_column
-from flexget.utils.tools import parse_timedelta
+from flexget.utils.tools import console, parse_timedelta
 
 log = logging.getLogger('remember_rej')
 Base = db_schema.versioned_base('remember_rejected', 3)
@@ -18,16 +20,8 @@ def upgrade(ver, session):
     if ver is None:
         columns = table_columns('remember_rejected_entry', session)
         if 'uid' in columns:
-            # Drop the old table
-            log.info('Dropping old version of remember_rejected_entry table from db')
-            drop_tables(['remember_rejected_entry'], session)
-            # Create new table from the current model
-            Base.metadata.create_all(bind=session.bind)
-            # We go directly to version 2, as remember_rejected_entries table has just been made from current model
-            # TODO: Fix this somehow. Just avoid dropping tables?
-            ver = 3
-        else:
-            ver = 0
+            raise db_schema.UpgradeImpossible
+        ver = 0
     if ver == 0:
         log.info('Adding reason column to remember_rejected_entry table.')
         table_add_column('remember_rejected_entry', 'reason', String, session)
@@ -80,17 +74,13 @@ class FilterRememberRejected(object):
         entry.reject('message', remember=True)
     """
 
-    @priority(0)
+    @plugin.priority(0)
     def on_task_start(self, task, config):
         """Purge remembered entries if the config has changed."""
         # See if the task has changed since last run
         old_task = task.session.query(RememberTask).filter(RememberTask.name == task.name).first()
-        if not task.is_rerun and old_task and (task.config_modified or task.manager.options.forget_rejected):
-            if task.manager.options.forget_rejected:
-                log.info('Forgetting previous rejections.')
-                task.config_changed()
-            else:
-                log.debug('Task config has changed since last run, purging remembered entries.')
+        if not task.is_rerun and old_task and task.config_modified:
+            log.debug('Task config has changed since last run, purging remembered entries.')
             task.session.delete(old_task)
             old_task = None
         if not old_task:
@@ -105,12 +95,12 @@ class FilterRememberRejected(object):
                 task.config_changed()
         task.session.commit()
 
-    @priority(-255)
+    @plugin.priority(-255)
     def on_task_input(self, task, config):
         for entry in task.all_entries:
             entry.on_reject(self.on_entry_reject, task=task)
 
-    @priority(255)
+    @plugin.priority(255)
     def on_task_filter(self, task, config):
         """Reject any remembered entries from previous runs"""
         (task_id,) = task.session.query(RememberTask.id).filter(RememberTask.name == task.name).first()
@@ -149,6 +139,36 @@ class FilterRememberRejected(object):
         # The test stops passing when this is taken out for some reason...
         task.session.flush()
 
+def do_cli(manager, options):
+    if options.rejected_action == 'list':
+        list_rejected()
+    elif options.rejected_action == 'clear':
+        clear_rejected(manager)
+
+def list_rejected():
+    session = Session()
+    try:
+        results = session.query(RememberEntry).all()
+        if not results:
+            console('No rejected entries recorded by remember_rejected')
+        else:
+            console('Rejections remembered by remember_rejected:')
+        for entry in results:
+            console('%s from %s by %s because %s' % (entry.title, entry.task.name, entry.rejected_by, entry.reason))
+    finally:
+        session.close()
+
+
+def clear_rejected(manager):
+    session = Session()
+    try:
+        results = session.query(RememberEntry).delete()
+        console('Cleared %i items.' % results)
+        session.commit()
+        if results:
+            manager.config_changed()
+    finally:
+        session.close()
 
 @event('manager.db_cleanup')
 def db_cleanup(session):
@@ -157,7 +177,13 @@ def db_cleanup(session):
     if result:
         log.verbose('Removed %d entries from remember rejected table.' % result)
 
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterRememberRejected, 'remember_rejected', builtin=True, api_ver=2)
 
-register_plugin(FilterRememberRejected, 'remember_rejected', builtin=True, api_ver=2)
-register_parser_option('--forget-rejected', action='store_true', dest='forget_rejected',
-                       help='Forget all previous rejections so entries can be processed again.')
+@event('options.register')
+def register_parser_arguments():
+    parser = options.register_command('rejected', do_cli, help='list or clear remembered rejections')
+    subparsers = parser.add_subparsers(dest='rejected_action', metavar='<action>')
+    subparsers.add_parser('list', help='list all the entries that have been rejected')
+    subparsers.add_parser('clear', help='clear all rejected entries from database, so they can be retried')

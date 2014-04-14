@@ -4,11 +4,12 @@ import csv
 import re
 from cgi import parse_header
 
+from flexget import plugin
+from flexget.event import event
 from flexget.utils import requests
 from flexget.utils.imdb import make_url
 from flexget.utils.cached_input import cached
 from flexget.utils.tools import decode_html
-from flexget.plugin import register_plugin, PluginError
 from flexget.entry import Entry
 from flexget.utils.soup import get_soup
 
@@ -32,7 +33,7 @@ class ImdbList(object):
             'password': {'type': 'string'},
             'list': {'type': 'string'}
         },
-        'required': ['list'],
+        'required': ['list', 'username', 'password'],
         'additionalProperties': False
     }
 
@@ -49,7 +50,9 @@ class ImdbList(object):
                 # First get the login page so we can get the hidden input value
                 soup = get_soup(sess.get('https://secure.imdb.com/register-imdb/login').content)
 
-                tag = soup.find('input', attrs={'name': '49e6c'})
+                # Fix for bs4 bug. see #2313 and github#118
+                auxsoup = soup.find('div', id='nb20').next_sibling.next_sibling
+                tag = auxsoup.find('input', attrs={'name': '49e6c'})
                 if tag:
                     params['49e6c'] = tag['value']
                 else:
@@ -57,7 +60,7 @@ class ImdbList(object):
                 # Now we do the actual login with appropriate parameters
                 r = sess.post('https://secure.imdb.com/register-imdb/login', data=params, raise_status=False)
             except requests.RequestException as e:
-                raise PluginError('Unable to login to imdb: %s' % e.message)
+                raise plugin.PluginError('Unable to login to imdb: %s' % e.args[0])
 
             # IMDb redirects us upon a successful login.
             # removed - doesn't happen always?
@@ -70,7 +73,7 @@ class ImdbList(object):
                 try:
                     response = sess.get('http://www.imdb.com/list/watchlist')
                 except requests.RequestException as e:
-                    log.error('Error retrieving user ID from imdb: %s' % e.message)
+                    log.error('Error retrieving user ID from imdb: %s' % e.args[0])
                     user_id = ''
                 else:
                     log.debug('redirected to %s' % response.url)
@@ -78,10 +81,10 @@ class ImdbList(object):
                 if re.match(USER_ID_RE, user_id):
                     config['user_id'] = user_id
                 else:
-                    raise PluginError('Couldn\'t figure out user_id, please configure it manually.')
+                    raise plugin.PluginError('Couldn\'t figure out user_id, please configure it manually.')
 
         if not 'user_id' in config:
-            raise PluginError('Configuration option `user_id` required.')
+            raise plugin.PluginError('Configuration option `user_id` required.')
 
         log.verbose('Retrieving list %s ...' % config['list'])
 
@@ -94,11 +97,11 @@ class ImdbList(object):
             mime_type = parse_header(opener.headers['content-type'])[0]
             log.debug('mime_type: %s' % mime_type)
             if mime_type != 'text/csv':
-                raise PluginError('Didn\'t get CSV export as response. Probably specified list `%s` does not exist.'
-                                  % config['list'])
+                raise plugin.PluginError('Didn\'t get CSV export as response. Probably specified list `%s` '
+                                         'does not exist.' % config['list'])
             csv_rows = csv.reader(opener.iter_lines())
         except requests.RequestException as e:
-            raise PluginError('Unable to get imdb list: %s' % e.message)
+            raise plugin.PluginError('Unable to get imdb list: %s' % e.args[0])
 
         # Create an Entry for each movie in the list
         entries = []
@@ -114,4 +117,6 @@ class ImdbList(object):
         return entries
 
 
-register_plugin(ImdbList, 'imdb_list', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(ImdbList, 'imdb_list', api_ver=2)

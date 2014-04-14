@@ -5,9 +5,9 @@ import random
 
 from sqlalchemy import Column, Integer, DateTime, Unicode, Index
 
+from flexget import options, plugin
 from flexget.event import event
-from flexget.utils.cached_input import cached
-from flexget.plugin import register_plugin, get_plugin_by_name, PluginError, PluginWarning, register_parser_option
+from flexget.plugin import get_plugin_by_name, PluginError, PluginWarning
 from flexget import db_schema
 from flexget.utils.tools import parse_timedelta, multiply_timedelta
 
@@ -107,10 +107,11 @@ class Discover(object):
 
                     if entry['title'] in entry_titles:
                         log.verbose('Ignored duplicate title `%s`' % entry['title'])    # TODO: should combine?
-                    else:
-                        entries.append(entry)
-                        entry_titles.add(entry['title'])
-                        entry_urls.update(urls)
+                        continue
+
+                    entries.append(entry)
+                    entry_titles.add(entry['title'])
+                    entry_urls.update(urls)
         return entries
 
     def execute_searches(self, config, entries):
@@ -130,7 +131,8 @@ class Discover(object):
             if not callable(getattr(search, 'search')):
                 log.critical('Search plugin %s does not implement search method' % plugin_name)
             for index, entry in enumerate(entries):
-                log.verbose('Searching for `%s` (%i of %i)' % (entry['title'], index + 1, len(entries)))
+                log.verbose('Searching for `%s` with plugin `%s` (%i of %i)' %
+                            (entry['title'], plugin_name, index + 1, len(entries)))
                 try:
                     search_results = search.search(entry, plugin_config)
                     if not search_results:
@@ -139,13 +141,16 @@ class Discover(object):
                         continue
                     log.debug('Discovered %s entries from %s' % (len(search_results), plugin_name))
                     if config.get('limit'):
-                        search_results  = sorted(search_results, reverse=True,
-                                                 key=lambda x: x.get('search_sort'))[:config['limit']]
+                        search_results = sorted(search_results, reverse=True,
+                                                key=lambda x: x.get('search_sort'))[:config['limit']]
                     for e in search_results:
+                        e['discovered_from'] = entry['title']
+                        e['discovered_with'] = plugin_name
                         e.on_complete(self.entry_complete, query=entry, search_results=search_results)
+
                     result.extend(search_results)
 
-                except (PluginError, PluginWarning), err:
+                except (PluginError, PluginWarning) as err:
                     log.debug('No results from %s: %s' % (plugin_name, err))
                     entry.complete()
 
@@ -187,9 +192,9 @@ class Discover(object):
 
     def interval_total_seconds(self, interval):
         """
-            Because python 2.6 doesn't have total_seconds()
+        Because python 2.6 doesn't have total_seconds()
         """
-        return (interval.seconds + interval.days * 24 * 3600)
+        return interval.seconds + interval.days * 24 * 3600
 
     def interval_expired(self, config, task, entries):
         """
@@ -200,7 +205,7 @@ class Discover(object):
         """
         config.setdefault('interval', '5 hour')
         interval = parse_timedelta(config['interval'])
-        if task.manager.options.discover_now:
+        if task.options.discover_now:
             log.info('Ignoring interval because of --discover-now')
         result = []
         interval_count = 0
@@ -213,7 +218,7 @@ class Discover(object):
                 log.debug('%s -> No previous run recorded' % entry['title'])
                 de = DiscoverEntry(entry['title'], task.name)
                 task.session.add(de)
-            if task.manager.options.discover_now or not de.last_execution:
+            if task.options.discover_now or not de.last_execution:
                 # First time we execute (and on --discover-now) we randomize time to avoid clumping
                 delta = multiply_timedelta(interval, random.random())
                 de.last_execution = datetime.datetime.now() - delta
@@ -249,6 +254,12 @@ class Discover(object):
         return self.execute_searches(config, entries)
 
 
-register_plugin(Discover, 'discover', api_ver=2)
-register_parser_option('--discover-now', action='store_true', dest='discover_now', default=False,
-                       help='Immediately try to discover everything.')
+@event('plugin.register')
+def register_plugin():
+    plugin.register(Discover, 'discover', api_ver=2)
+
+
+@event('options.register')
+def register_parser_arguments():
+    options.get_parser('execute').add_argument('--discover-now', action='store_true', dest='discover_now',
+                                               default=False, help='immediately try to discover everything')

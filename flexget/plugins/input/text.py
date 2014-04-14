@@ -2,9 +2,11 @@
 from __future__ import unicode_literals, division, absolute_import
 import re
 import logging
+
+from flexget import plugin
 from flexget.entry import Entry
+from flexget.event import event
 from flexget.utils.cached_input import cached
-from flexget.plugin import register_plugin, internet
 
 log = logging.getLogger('text')
 
@@ -54,10 +56,13 @@ class Text(object):
             entry[k] = v % entry
 
     @cached('text')
-    @internet(log)
+    @plugin.internet(log)
     def on_task_input(self, task, config):
         url = config['url']
-        request = task.requests.get(url)
+        if '://' in url:
+            lines = task.requests.get(url).iter_lines()
+        else:
+            lines = open(url, 'rb').readlines()
 
         entry_config = config.get('entry')
         format_config = config.get('format', {})
@@ -68,7 +73,7 @@ class Text(object):
         entry = Entry()
 
         # now parse text
-        for line in request.iter_lines():
+        for line in lines:
             for field, regexp in entry_config.iteritems():
                 #log.debug('search field: %s regexp: %s' % (field, regexp))
                 match = re.search(regexp, line)
@@ -87,7 +92,11 @@ class Text(object):
                         used = {}
 
                     # add field to entry
-                    entry[field] = match.group(1)
+                    try:
+                        entry[field] = match.group(1)
+                    except IndexError:
+                        log.error('regex for field `%s` must contain a capture group' % field)
+                        raise plugin.PluginError('Your text plugin config contains errors, please correct them.')
                     used[field] = True
                     log.debug('found field: %s value: %s' % (field, entry[field]))
 
@@ -106,4 +115,6 @@ class Text(object):
         return entries
 
 
-register_plugin(Text, 'text', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(Text, 'text', api_ver=2)

@@ -1,6 +1,7 @@
 from __future__ import unicode_literals, division, absolute_import
+
 from flexget import plugin
-from flexget import validator
+from flexget.event import event
 
 
 class Magnets(object):
@@ -14,7 +15,7 @@ class Magnets(object):
             return
         for entry in task.accepted:
             if 'urls' in entry:
-                entry['urls'] = filter(lambda url: not url.startswith('magnet:'), entry['urls'])
+                entry['urls'] = [url for url in entry['urls'] if not url.startswith('magnet:')]
 
             if entry['url'].startswith('magnet:'):
                 if entry.get('urls'):
@@ -22,4 +23,7 @@ class Magnets(object):
                 else:
                     entry.reject('Magnet urls not allowed.', remember=True)
 
-plugin.register_plugin(Magnets, 'magnets', api_ver=2)
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(Magnets, 'magnets', api_ver=2)

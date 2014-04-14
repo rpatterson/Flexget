@@ -2,15 +2,13 @@ __author__ = 'deksan'
 
 import logging
 import urllib
-from urlparse import urlparse
 
 import feedparser
 
-from flexget import validator
+from flexget import plugin, validator
 from flexget.entry import Entry
-from flexget.plugin import register_plugin
+from flexget.event import event
 from flexget.plugins.api_tvrage import lookup_series
-from flexget.utils.requests import Session
 
 log = logging.getLogger('newznab')
 
@@ -31,14 +29,17 @@ class Newznab(object):
     Category is any of: movie, tvsearch, music, book
     """
 
-    def validator(self):
-        """Return config validator."""
-        root = validator.factory('dict')
-        root.accept('url', key='url', required=False)
-        root.accept('url', key='website', required=False)
-        root.accept('text', key='apikey', required=False)
-        root.accept('choice', key='category', required=True).accept_choices(['movie', 'tvsearch', 'tv', 'music', 'book'])
-        return root
+    schema = {
+        'type': 'object',
+        'properties': {
+            'category': {'type': 'string', 'enum': ['movie', 'tvsearch', 'tv', 'music', 'book']},
+            'url': {'type': 'string', 'format': 'url'},
+            'website': {'type': 'string', 'format': 'url'},
+            'apikey': {'type': 'string'}
+        },
+        'required': ['category'],
+        'additionalProperties': False
+    }
 
     def build_config(self, config):
         if config['category'] == 'tv':
@@ -108,4 +109,7 @@ class Newznab(object):
         url = config['url'] + '&imdbid=' + imdb_id
         return self.fill_entries_for_url(url, config)
 
-register_plugin(Newznab, 'newznab', api_ver=2, groups=['search'])
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(Newznab, 'newznab', api_ver=2, groups=['search'])

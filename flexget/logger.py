@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import string
+import warnings
 
 # A level more detailed than DEBUG
 TRACE = 5
@@ -17,8 +18,7 @@ class FlexGetLogger(logging.Logger):
     local = threading.local()
 
     def makeRecord(self, name, level, fn, lno, msg, args, exc_info, func=None, extra=None):
-        extra = {'task': getattr(FlexGetLogger.local, 'task', u''),
-                 'execution': getattr(FlexGetLogger.local, 'execution', '')}
+        extra = {'task': getattr(FlexGetLogger.local, 'task', '')}
         return logging.Logger.makeRecord(self, name, level, fn, lno, msg, args, exc_info, func, extra)
 
     def trace(self, msg, *args, **kwargs):
@@ -28,9 +28,6 @@ class FlexGetLogger(logging.Logger):
     def verbose(self, msg, *args, **kwargs):
         """Log at VERBOSE level (displayed when FlexGet is run interactively.)"""
         self.log(VERBOSE, msg, *args, **kwargs)
-
-    # backwards compatibility
-    debugall = trace
 
 
 class FlexGetFormatter(logging.Formatter):
@@ -108,6 +105,7 @@ def initialize(unit_test=False):
     if _logging_configured:
         return
 
+    warnings.simplefilter('once')
     logging.addLevelName(TRACE, 'TRACE')
     logging.addLevelName(VERBOSE, 'VERBOSE')
     _logging_configured = True
@@ -134,10 +132,6 @@ def initialize(unit_test=False):
         logger.setLevel(logging.DEBUG)
     elif '--debug-trace' in sys.argv:
         logger.setLevel(TRACE)
-    elif '--cron' not in sys.argv:
-        logger.setLevel(VERBOSE)
-    else:
-        logger.setLevel(logging.INFO)
 
     # without --cron we log to console
     # this must be done at initialize because otherwise there will be too much delay (user feedback) (see #1113)

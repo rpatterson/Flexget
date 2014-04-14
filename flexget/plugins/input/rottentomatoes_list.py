@@ -1,14 +1,16 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
-from flexget.plugin import register_plugin, DependencyError
-from flexget.utils.cached_input import cached
+
+from flexget import plugin
 from flexget.entry import Entry
+from flexget.event import event
+from flexget.utils.cached_input import cached
 
 try:
         from flexget.plugins.api_rottentomatoes import lists
 except ImportError:
-        raise DependencyError(issued_by='rottentomatoes_lookup', missing='api_rottentomatoes',
-                              message='rottentomatoes_lookup requires the `api_rottentomatoes` plugin')
+        raise plugin.DependencyError(issued_by='rottentomatoes_lookup', missing='api_rottentomatoes',
+                                     message='rottentomatoes_lookup requires the `api_rottentomatoes` plugin')
 
 log = logging.getLogger('rottentomatoes_list')
 
@@ -52,7 +54,7 @@ class RottenTomatoesList(object):
                 results = lists(list_type=l_type, list_name=l_name)
                 if results:
                     for movie in results['movies']:
-                        if filter(lambda entry: movie['title'] == entry.get('title'), entries):
+                        if [entry for entry in entries if movie['title'] == entry.get('title')]:
                             continue
                         imdb_id = movie.get('alternate_ids', {}).get('imdb')
                         if imdb_id:
@@ -66,4 +68,6 @@ class RottenTomatoesList(object):
                             (l_type, l_name))
         return entries
 
-register_plugin(RottenTomatoesList, 'rottentomatoes_list', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(RottenTomatoesList, 'rottentomatoes_list', api_ver=2)

@@ -1,21 +1,27 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
+
 from bs4 import BeautifulSoup
-from flexget.utils import requests
-from flexget.entry import Entry
+
 from flexget import plugin
+from flexget.entry import Entry
+from flexget.event import event
+from flexget.utils import requests
 
 log = logging.getLogger('pogcal')
 
 
 class InputPogDesign(object):
 
-    def validator(self):
-        from flexget import validator
-        config = validator.factory('dict')
-        config.accept('text', key='username', required=True)
-        config.accept('text', key='password', required=True)
-        return config
+    schema = {
+        'type': 'object',
+        'properties': {
+            'username': {'type': 'string'},
+            'password': {'type': 'string'}
+        },
+        'required': ['username', 'password'],
+        'additionalProperties': False
+    }
 
     name_map = {'The Tonight Show [Leno]': 'The Tonight Show With Jay Leno',
                 'Late Show [Letterman]': 'David Letterman'}
@@ -34,7 +40,7 @@ class InputPogDesign(object):
         entries = []
         for row in soup.find_all('label', {'class': 'label_check'}):
             if row.find(attrs={'checked': 'checked'}):
-                t = row.text
+                t = row.find('strong').text
                 if t.endswith('[The]'):
                     t = 'The ' + t[:-6]
 
@@ -44,9 +50,12 @@ class InputPogDesign(object):
 
                 e = Entry()
                 e['title'] = t
-                url = row.find_next('a', {'class': 'selectsummary'})
+                url = row.find_next('a', {'class': 'slink'})
                 e['url'] = 'http://www.pogdesign.co.uk' + url['href']
                 entries.append(e)
         return entries
 
-plugin.register_plugin(InputPogDesign, 'pogcal', api_ver=2)
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(InputPogDesign, 'pogcal', api_ver=2)

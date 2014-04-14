@@ -1,11 +1,13 @@
-from __future__ import unicode_literals, division, absolute_import
+from __future__ import unicode_literals, division, absolute_import, print_function
 import logging
-from flexget.plugin import register_plugin, register_parser_option
+
+from flexget import options, plugin
+from flexget.event import event
 
 log = logging.getLogger('try_regexp')
 
 
-class PluginTryRegexp:
+class PluginTryRegexp(object):
     """
         This plugin allows user to test regexps for a task.
     """
@@ -23,16 +25,16 @@ class PluginTryRegexp:
                 return (True, field)
         return (False, None)
 
-    def on_task_filter(self, task):
-        if not task.manager.options.try_regexp:
+    def on_task_filter(self, task, config):
+        if not task.options.try_regexp:
             return
         if self.abort:
             return
 
-        print '-' * 79
-        print 'Hi there, welcome to try regexps in realtime!'
-        print 'Press ^D or type \'exit\' to continue. Type \'continue\' to continue non-interactive execution.'
-        print 'Task \'%s\' has %s entries, enter regexp to see what matches it.' % (task.name, len(task.entries))
+        print('-' * 79)
+        print('Hi there, welcome to try regexps in realtime!')
+        print('Press ^D or type \'exit\' to continue. Type \'continue\' to continue non-interactive execution.')
+        print('Task \'%s\' has %s entries, enter regexp to see what matches it.' % (task.name, len(task.entries)))
         while (True):
             try:
                 s = raw_input('--> ')
@@ -49,14 +51,21 @@ class PluginTryRegexp:
                 try:
                     match, field = self.matches(entry, s)
                     if match:
-                        print 'Title: %-40s URL: %-30s From: %s' % (entry['title'], entry['url'], field)
+                        print('Title: %-40s URL: %-30s From: %s' % (entry['title'], entry['url'], field))
                         count += 1
                 except:
-                    print 'Invalid regular expression'
+                    print('Invalid regular expression')
                     break
-            print '%s of %s entries matched' % (count, len(task.entries))
-        print 'Bye!'
+            print('%s of %s entries matched' % (count, len(task.entries)))
+        print('Bye!')
 
-register_plugin(PluginTryRegexp, '--try-regexp', builtin=True)
-register_parser_option('--try-regexp', action='store_true', dest='try_regexp', default=False,
-                       help='Try regular expressions interactively.')
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(PluginTryRegexp, '--try-regexp', builtin=True, api_ver=2)
+
+
+@event('options.register')
+def register_parser_arguments():
+    options.get_parser('execute').add_argument('--try-regexp', action='store_true', dest='try_regexp', default=False,
+                                               help='try regular expressions interactively')

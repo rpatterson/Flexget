@@ -4,26 +4,27 @@ import logging
 from sqlalchemy import Column, Integer, String, ForeignKey, or_, and_, select, update
 from sqlalchemy.orm.exc import NoResultFound
 
-from flexget import db_schema
+from flexget import db_schema, plugin
+from flexget.entry import Entry
+from flexget.event import event
 from flexget.manager import Session
 from flexget.utils import qualities
 from flexget.utils.imdb import extract_id
+from flexget.utils.log import log_once
 from flexget.utils.database import quality_requirement_property, with_session
 from flexget.utils.sqlalchemy_utils import table_exists, table_schema
-from flexget.plugin import DependencyError, get_plugin_by_name, register_plugin
-from flexget.event import event
 
 try:
     from flexget.plugins.filter import queue_base
 except ImportError:
-    raise DependencyError(issued_by='movie_queue', missing='queue_base',
-                          message='movie_queue requires the queue_base plugin')
+    raise plugin.DependencyError(issued_by='movie_queue', missing='queue_base',
+                                 message='movie_queue requires the queue_base plugin')
 
 log = logging.getLogger('movie_queue')
 Base = db_schema.versioned_base('movie_queue', 2)
 
 
-@event('manager.startup')
+@event('manager.lock_acquired')
 def migrate_imdb_queue(manager):
     """If imdb_queue table is found, migrate the data to movie_queue"""
     session = Session()
@@ -33,7 +34,7 @@ def migrate_imdb_queue(manager):
             old_table = table_schema('imdb_queue', session)
             for row in session.execute(old_table.select()):
                 try:
-                    queue_add(imdb_id=row['imdb_id'], quality=row['quality'], force=row['immortal'], session=session)
+                    queue_add(imdb_id=row['imdb_id'], quality=row['quality'], session=session)
                 except QueueError as e:
                     log.error('Unable to migrate %s from imdb_queue to movie_queue' % row['title'])
             old_table.drop()
@@ -81,25 +82,25 @@ class FilterMovieQueue(queue_base.FilterQueueBase):
     def matches(self, task, config, entry):
         # Tell tmdb_lookup to add lazy lookup fields if not already present
         try:
-            get_plugin_by_name('tmdb_lookup').instance.lookup(entry)
-        except DependencyError:
-            log.debug('tmdb_lookup is not available, queue will not work if movie ids are not populated')
-        try:
-            get_plugin_by_name('imdb_lookup').instance.register_lazy_fields(entry)
-        except DependencyError:
+            plugin.get_plugin_by_name('imdb_lookup').instance.register_lazy_fields(entry)
+        except plugin.DependencyError:
             log.debug('imdb_lookup is not available, queue will not work if movie ids are not populated')
-            # make sure the entry has a movie id field filled
+        try:
+            plugin.get_plugin_by_name('tmdb_lookup').instance.lookup(entry)
+        except plugin.DependencyError:
+            log.debug('tmdb_lookup is not available, queue will not work if movie ids are not populated')
+    
         conditions = []
         # Check if a movie id is already populated before incurring a lazy lookup
         for lazy in [False, True]:
             if entry.get('imdb_id', eval_lazy=lazy):
                 conditions.append(QueuedMovie.imdb_id == entry['imdb_id'])
-            if entry.get('tmdb_id', eval_lazy=lazy):
+            if entry.get('tmdb_id', eval_lazy=lazy and not conditions):
                 conditions.append(QueuedMovie.tmdb_id == entry['tmdb_id'])
             if conditions:
                 break
         if not conditions:
-            log.verbose('IMDB and TMDB lookups failed for %s.' % entry['title'])
+            log_once('IMDB and TMDB lookups failed for %s.' % entry['title'], log, logging.WARN)
             return
 
         quality = entry.get('quality', qualities.Quality())
@@ -137,34 +138,39 @@ def parse_what(what, lookup=True, session=None):
     :return: A dictionary with 'title', 'imdb_id' and 'tmdb_id' keys
     """
 
-    tmdb_lookup = get_plugin_by_name('api_tmdb').instance.lookup
+    tmdb_lookup = plugin.get_plugin_by_name('api_tmdb').instance.lookup
 
     result = {'title': None, 'imdb_id': None, 'tmdb_id': None}
     result['imdb_id'] = extract_id(what)
-    if not result['imdb_id'] and what.startswith('tmdb_id='):
-        result['tmdb_id'] = what[8:]
-    else:
-        result['title'] = what
+    if not result['imdb_id']:
+        if what.startswith('tmdb_id='):
+            result['tmdb_id'] = what[8:]
+        else:
+            result['title'] = what
 
     if not lookup:
         # If not doing an online lookup we can return here
         return result
 
-    try:
-        result['session'] = session
-        movie = tmdb_lookup(**result)
-    except LookupError as e:
-        raise QueueError(e.message)
+    search_entry = Entry(title=result['title'] or '')
+    for field in ['imdb_id', 'tmdb_id']:
+        if result.get(field):
+            search_entry[field] = result[field]
+    # Put lazy lookup fields on the search entry
+    plugin.get_plugin_by_name('imdb_lookup').instance.register_lazy_fields(search_entry)
+    plugin.get_plugin_by_name('tmdb_lookup').instance.lookup(search_entry)
 
-    if movie:
-        return {'title': movie.name, 'imdb_id': movie.imdb_id, 'tmdb_id': movie.id}
-    else:
-        raise QueueError('ERROR: Unable to find any such movie from tmdb, use imdb or tmdb id instead.')
+    try:
+        # Both ids are optional, but if movie_name was populated at least one of them will be there
+        return {'title': search_entry['movie_name'], 'imdb_id': search_entry.get('imdb_id'),
+                'tmdb_id': search_entry.get('tmdb_id')}
+    except KeyError as e:
+        raise QueueError(e.message)
 
 
 # API functions to edit queue
 @with_session
-def queue_add(title=None, imdb_id=None, tmdb_id=None, quality=None, force=True, session=None):
+def queue_add(title=None, imdb_id=None, tmdb_id=None, quality=None, session=None):
     """
     Add an item to the queue with the specified quality requirements.
 
@@ -174,7 +180,6 @@ def queue_add(title=None, imdb_id=None, tmdb_id=None, quality=None, force=True, 
     :param imdb_id: IMDB id for the movie. (optional)
     :param tmdb_id: TMDB id for the movie. (optional)
     :param quality: A QualityRequirements object defining acceptable qualities.
-    :param force: If this is true, accepted movie will be marked as immortal.
     :param session: Optional session to use for database updates
     """
 
@@ -192,15 +197,15 @@ def queue_add(title=None, imdb_id=None, tmdb_id=None, quality=None, force=True, 
                                                  and_(QueuedMovie.tmdb_id != None, QueuedMovie.tmdb_id == tmdb_id))). \
         first()
     if not item:
-        item = QueuedMovie(title=title, imdb_id=imdb_id, tmdb_id=tmdb_id, quality=quality.text, immortal=force)
+        item = QueuedMovie(title=title, imdb_id=imdb_id, tmdb_id=tmdb_id, quality=quality.text)
         session.add(item)
-        log.info('Adding %s to movie queue with quality=%s and force=%s.' % (title, quality, force))
-        return {'title': title, 'imdb_id': imdb_id, 'tmdb_id': tmdb_id, 'quality': quality, 'force': force}
+        log.info('Adding %s to movie queue with quality=%s.' % (title, quality))
+        return {'title': title, 'imdb_id': imdb_id, 'tmdb_id': tmdb_id, 'quality': quality}
     else:
         if item.downloaded:
             raise QueueError('ERROR: %s has already been queued and downloaded' % title)
         else:
-            raise QueueError('ERROR: %s is already in the queue' % title)
+            raise QueueError('ERROR: %s is already in the queue' % title, errno=1)
 
 
 @with_session
@@ -217,9 +222,11 @@ def queue_del(title=None, imdb_id=None, tmdb_id=None, session=None):
     """
     log.debug('queue_del - title=%s, imdb_id=%s, tmdb_id=%s' % (title, imdb_id, tmdb_id))
     query = session.query(QueuedMovie)
-    if imdb_id or tmdb_id:
-        query = query.filter(or_(QueuedMovie.imdb_id == imdb_id, QueuedMovie.tmdb_id == tmdb_id))
-    if title:
+    if imdb_id:
+        query = query.filter(QueuedMovie.imdb_id == imdb_id)
+    elif tmdb_id:
+        query = query.filter(QueuedMovie.tmdb_id == tmdb_id)
+    elif title:
         query = query.filter(QueuedMovie.title == title)
     try:
         item = query.one()
@@ -244,9 +251,11 @@ def queue_forget(title=None, imdb_id=None, tmdb_id=None, session=None):
     """
     log.debug('queue_forget - title=%s, imdb_id=%s, tmdb_id=%s' % (title, imdb_id, tmdb_id))
     query = session.query(QueuedMovie)
-    if imdb_id or tmdb_id:
-        query = query.filter(or_(QueuedMovie.imdb_id == imdb_id, QueuedMovie.tmdb_id == tmdb_id))
-    if title:
+    if imdb_id:
+        query = query.filter(QueuedMovie.imdb_id == imdb_id)
+    elif tmdb_id:
+        query = query.filter(QueuedMovie.tmdb_id == tmdb_id)
+    elif title:
         query = query.filter(QueuedMovie.title == title)
     try:
         item = query.one()
@@ -293,4 +302,6 @@ def queue_get(session=None, downloaded=False):
         return session.query(QueuedMovie).filter(QueuedMovie.downloaded != None).all()
 
 
-register_plugin(FilterMovieQueue, 'movie_queue', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterMovieQueue, 'movie_queue', api_ver=2)

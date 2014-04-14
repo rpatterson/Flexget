@@ -5,7 +5,8 @@ import difflib
 import os.path
 import logging
 
-from flexget.plugin import register_plugin
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.tools import urlopener
 
 """
@@ -53,18 +54,18 @@ class Subtitles(object):
     Fetch subtitles from opensubtitles.org
     """
 
-    def validator(self):
-        from flexget import validator
-        subs = validator.factory('dict')
-        langs = subs.accept('list', key='languages')
-        langs.accept('text')
-        subs.accept('number', key='min_sub_rating')
-        subs.accept('number', key='match_limit')
-        subs.accept('path', key='output')
-        return subs
+    schema = {
+        'type': 'object',
+        'properties': {
+            'languages': {'type': 'array', 'items': {'type': 'string'}},
+            'min_sub_rating': {'type': 'number'},
+            'match_limit': {'type': 'number'},
+            'output': {'type': 'string', 'format': 'path'}
+        },
+        'additionalProperties': False
+    }
 
-    def get_config(self, task):
-        config = task.config['subtitles']
+    def prepare_config(self, config, task):
         if not isinstance(config, dict):
             config = {}
         config.setdefault('output', task.manager.config_base)
@@ -74,11 +75,11 @@ class Subtitles(object):
         config['output'] = os.path.expanduser(config['output'])
         return config
 
-    def on_task_download(self, task):
+    def on_task_download(self, task, config):
 
         # filter all entries that have IMDB ID set
         try:
-            entries = filter(lambda x: x['imdb_url'] is not None, task.accepted)
+            entries = [e for e in task.accepted if e['imdb_id'] is not None]
         except KeyError:
             # No imdb urls on this task, skip it
             # TODO: should do lookup via imdb_lookup plugin?
@@ -94,7 +95,7 @@ class Subtitles(object):
         if res['status'] != '200 OK':
             raise Exception("Login to opensubtitles.org XML-RPC interface failed")
 
-        config = self.get_config(task)
+        config = self.prepare_config(config, task)
 
         token = res['token']
 
@@ -105,13 +106,10 @@ class Subtitles(object):
 
         # loop through the entries
         for entry in entries:
-            # dig out the raw imdb id
-            m = re.search("tt(\d+)/$", entry['imdb_url'])
-            if not m:
-                log.debug("no match for %s" % entry['imdb_url'])
+            imdbid = entry.get('imdb_id')
+            if not imdbid:
+                log.debug('no match for %s' % entry['title'])
                 continue
-
-            imdbid = m.group(1)
 
             query = []
             for language in languages:
@@ -125,15 +123,16 @@ class Subtitles(object):
                 continue
 
             # filter bad subs
-            subtitles = filter(lambda x: x['SubBad'] == '0', subtitles)
+            subtitles = [x for x in subtitles if x['SubBad'] == '0']
             # some quality required (0.0 == not reviewed)
-            subtitles = filter(lambda x: float(x['SubRating']) >= min_sub_rating or float(x['SubRating']) == 0.0, subtitles)
+            subtitles = [x for x in subtitles if
+                         float(x['SubRating']) >= min_sub_rating or float(x['SubRating']) == 0.0]
 
             filtered_subs = []
 
             # find the best rated subs for each language
             for language in languages:
-                langsubs = filter(lambda x: x['SubLanguageID'] == language, subtitles)
+                langsubs = [x for x in subtitles if x['SubLanguageID'] == language]
 
                 # did we find any subs for this language?
                 if langsubs:
@@ -144,7 +143,7 @@ class Subtitles(object):
                         return s.ratio() > match_limit
 
                     # filter only those that have matching release names
-                    langsubs = filter(lambda x: seqmatch(x['MovieReleaseName']), subtitles)
+                    langsubs = [x for x in subtitles if seqmatch(x['MovieReleaseName'])]
 
                     if langsubs:
                         # find the best one by SubRating
@@ -166,4 +165,7 @@ class Subtitles(object):
 
         s.LogOut(token)
 
-register_plugin(Subtitles, 'subtitles')
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(Subtitles, 'subtitles', api_ver=2)

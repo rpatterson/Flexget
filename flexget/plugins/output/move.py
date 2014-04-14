@@ -4,7 +4,8 @@ import shutil
 import logging
 import time
 
-from flexget.plugin import register_plugin
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.template import RenderError
 from flexget.utils.pathscrub import pathscrub
 
@@ -37,7 +38,7 @@ class MovePlugin(object):
                     'unpack_safety': {'type': 'boolean'},
                     'allow_dir': {'type': 'boolean'},
                     'clean_source': {'type': 'number'},
-                    #'move_with': {'type': 'array', 'items': {'type': 'string'}}  # TODO
+                    'along': {'type': 'array', 'items': {'type': 'string'}}
                 },
                 'additionalProperties': False
             }
@@ -106,12 +107,12 @@ class MovePlugin(object):
                 continue
 
             if not os.path.exists(dst_path):
-                if task.manager.options.test:
+                if task.options.test:
                     log.info('Would create `%s`' % dst_path)
                 else:
                     log.info('Creating destination directory `%s`' % dst_path)
                     os.makedirs(dst_path)
-            if not os.path.isdir(dst_path) and not task.manager.options.test:
+            if not os.path.isdir(dst_path) and not task.options.test:
                 log.warning('Cannot move `%s` because destination `%s` is not a directory' % (entry['title'], dst_path))
                 continue
 
@@ -141,13 +142,39 @@ class MovePlugin(object):
             if dst_ext != src_ext:
                 log.verbose('Adding extension `%s` to dst `%s`' % (src_ext, dst))
                 dst += src_ext
-
+            
+            # Collect wanted namesakes
+            ns_src = []
+            ns_dst = []
+            if 'along' in config and os.path.isfile(src):
+                for ext in config['along']:
+                    if not ext.startswith('.'):
+                        ext = '.' + ext
+                    if os.path.exists(src_filename + ext):
+                        ns_src.append(src_filename + ext)
+                        ns_dst.append(dst_filename + ext)
+            
             # Move stuff
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Would move `%s` to `%s`' % (src, dst))
+                # Collected namesakes
+                for nss, nsd in zip(ns_src, ns_dst):
+                    log.info('Would also move `%s` to `%s`' % (nss, nsd))
             else:
-                log.info('Moving `%s` to `%s`' % (src, dst))
-                shutil.move(src, dst)
+                try:
+                    shutil.move(src, dst)
+                except IOError as e:
+                    entry.fail('IOError: %s' % (e))
+                    log.debug('Unable to move %s to %s' % (src, dst))
+                    continue
+                # Collected namesakes
+                for nss, nsd in zip(ns_src, ns_dst):
+                    try:
+                        log.info('Moving `%s` to `%s`' % (nss, nsd))
+                        shutil.move(nss, nsd)
+                    except Exception as err:
+                        log.error(err.message)
+
             entry['output'] = dst
             if 'clean_source' in config:
                 if not os.path.isdir(src):
@@ -155,7 +182,7 @@ class MovePlugin(object):
                     size = get_directory_size(base_path) / 1024 / 1024
                     log.debug('base_path: %s size: %s' % (base_path, size))
                     if size <= config['clean_source']:
-                        if task.manager.options.test:
+                        if task.options.test:
                             log.info('Would delete %s and everything under it' % base_path)
                         else:
                             log.info('Deleting `%s`' % base_path)
@@ -167,4 +194,6 @@ class MovePlugin(object):
                     log.verbose('Cannot clean_source `%s` because source is a directory' % src)
 
 
-register_plugin(MovePlugin, 'move', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(MovePlugin, 'move', api_ver=2)

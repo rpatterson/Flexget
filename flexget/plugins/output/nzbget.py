@@ -1,5 +1,7 @@
 import logging
-from flexget.plugin import register_plugin
+
+from flexget import plugin
+from flexget.event import event
 
 log = logging.getLogger('nzbget')
 
@@ -35,7 +37,7 @@ class OutputNzbget(object):
         server = ServerProxy(params["url"])
 
         for entry in task.accepted:
-            if task.manager.options.test:
+            if task.options.test:
                 log.info('Would add into nzbget: %s' % entry['title'])
                 continue
 
@@ -44,10 +46,13 @@ class OutputNzbget(object):
                 params['category'] = entry['category']
 
             try:
-                server.appendurl(entry["title"], params["category"], params["priority"], params["top"], entry["url"])
+                server.appendurl(entry["title"] + '.nzb', params["category"], params["priority"], params["top"], entry["url"])
                 log.info("Added `%s` to nzbget" % entry["title"])
             except:
                 log.critical("rpc call to nzbget failed")
                 entry.fail("could not call appendurl via RPC")
 
-register_plugin(OutputNzbget, 'nzbget', api_ver=2)
+
+@event('plugin.register')
+def register_plugin():
+    plugin.register(OutputNzbget, 'nzbget', api_ver=2)

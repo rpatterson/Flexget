@@ -1,19 +1,31 @@
 from __future__ import unicode_literals, division, absolute_import
-import subprocess
+from collections import Mapping
 import logging
+import subprocess
 import sys
-from UserDict import UserDict
-from flexget.plugin import register_plugin, phase_methods
+
+
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.template import render_from_entry, render_from_task, RenderError
 
 log = logging.getLogger('exec')
 
 
-class EscapingDict(UserDict):
+class EscapingDict(Mapping):
     """Helper class, same as a dict, but returns all string value with quotes escaped."""
 
+    def __init__(self, mapping):
+        self._data = mapping
+
+    def __len__(self):
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
     def __getitem__(self, key):
-        value = self.data[key]
+        value = self._data[key]
         if isinstance(value, basestring):
             # TODO: May need to be different depending on OS
             value = value.replace('"', '\\"')
@@ -129,7 +141,7 @@ class PluginExec(object):
                     continue
 
                 log.debug('phase_name: %s operation: %s cmd: %s' % (phase_name, operation, cmd))
-                if task.manager.options.test:
+                if task.options.test:
                     log.info('Would execute: %s' % cmd)
                 else:
                     # Make sure the command can be encoded into appropriate encoding, don't actually encode yet,
@@ -154,7 +166,7 @@ class PluginExec(object):
                 log.error('Error rendering `%s`: %s' % (cmd, e))
             else:
                 log.debug('phase cmd: %s' % cmd)
-                if task.manager.options.test:
+                if task.options.test:
                     log.info('Would execute: %s' % cmd)
                 else:
                     self.execute_cmd(cmd, allow_background, config['encoding'])
@@ -162,7 +174,7 @@ class PluginExec(object):
     def __getattr__(self, item):
         """Creates methods to handle task phases."""
         for phase in self.HANDLED_PHASES:
-            if item == phase_methods[phase]:
+            if item == plugin.phase_methods[phase]:
                 # A phase method we handle has been requested
                 break
         else:
@@ -177,4 +189,6 @@ class PluginExec(object):
         return phase_handler
 
 
-register_plugin(PluginExec, 'exec', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(PluginExec, 'exec', api_ver=2)

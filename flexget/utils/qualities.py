@@ -158,7 +158,10 @@ _audios = [
     QualityComponent('audio', 30, 'aac', 'aac%s?' % channels),
     QualityComponent('audio', 40, 'ac3', 'ac3%s?' % channels),
     QualityComponent('audio', 50, 'flac', 'flac%s?' % channels),
-    QualityComponent('audio', 60, 'dts')
+    # The DTSs are a bit backwards, but the more specific one needs to be parsed first
+    QualityComponent('audio', 60, 'dtshd', 'dts[\W_]?hd(?:[\W_]?ma)?'),
+    QualityComponent('audio', 70, 'dts'),
+    QualityComponent('audio', 80, 'truehd')
 ]
 
 _UNKNOWNS = {
@@ -435,7 +438,7 @@ class Requirements(object):
                     if found.type == component.type:
                         component.add_requirement(part)
         except KeyError as e:
-            raise ValueError('%s is not a valid quality component.' % e.message)
+            raise ValueError('%s is not a valid quality component.' % e.args[0])
 
     def allows(self, qual, loose=False):
         """Determine whether this set of requirements allows a given quality.

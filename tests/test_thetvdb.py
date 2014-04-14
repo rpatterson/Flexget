@@ -8,7 +8,7 @@ from tests import FlexGetBase
 class TestThetvdbLookup(FlexGetBase):
 
     __yaml__ = """
-        presets:
+        templates:
           global:
             thetvdb_lookup: yes
             # Access a tvdb field to cause lazy loading to occur
@@ -53,9 +53,9 @@ class TestThetvdbLookup(FlexGetBase):
         entry = self.task.find_entry(title='House.S01E02.HDTV.XViD-FlexGet')
         assert entry['tvdb_ep_name'] == 'Paternity', \
             '%s tvdb_ep_name should be Paternity' % entry['title']
-        assert int(entry['tvdb_runtime']) == 60, \
-            'runtime for %s is %s, should be 60' % (entry['title'], entry['tvdb_runtime'])
-        assert entry['tvdb_genres'] == ['Comedy', 'Drama']
+        assert entry['tvdb_status'] == 'Ended', \
+            'runtime for %s is %s, should be Ended' % (entry['title'], entry['tvdb_status'])
+        assert entry['tvdb_absolute_number'] == 3
         assert entry['afield'] == '73255Paternity', 'afield was not set correctly'
         assert self.task.find_entry(tvdb_ep_name='School Reunion'), \
             'Failed imdb lookup Doctor Who 2005 S02E03'
@@ -123,7 +123,7 @@ class TestThetvdbFavorites(FlexGetBase):
               - {title: 'Doctor.Who.2005.S02E03.PDTV.XViD-FlexGet'}
               - {title: 'Lost.S03E02.720p-FlexGet'}
               - {title: 'Penn.and.Teller.Bullshit.S02E02.720p.x264'}
-            import_series:
+            configure_series:
               from:
                 thetvdb_favorites:
                   account_id: 80FB8BD0720CA5EC

@@ -1,4 +1,5 @@
 from __future__ import unicode_literals, division, absolute_import
+import argparse
 import logging
 import re
 import time
@@ -11,9 +12,10 @@ from sqlalchemy.orm import relation, backref
 from sqlalchemy.ext.hybrid import Comparator, hybrid_property
 from sqlalchemy.exc import OperationalError
 
-from flexget import db_schema
+from flexget import db_schema, options, plugin
 from flexget.config_schema import one_or_more
 from flexget.event import event
+from flexget.manager import Session
 from flexget.utils import qualities
 from flexget.utils.log import log_once
 from flexget.utils.titles import SeriesParser, ParseWarning, ID_TYPES
@@ -21,9 +23,6 @@ from flexget.utils.sqlalchemy_utils import (table_columns, table_exists, drop_ta
                                             create_index)
 from flexget.utils.tools import merge_dict_from_to, parse_timedelta
 from flexget.utils.database import quality_property
-from flexget.manager import Session
-from flexget.plugin import (register_plugin, register_parser_option, get_plugin_by_name, DependencyError, priority,
-                            PluginError)
 
 SCHEMA_VER = 11
 
@@ -164,17 +163,39 @@ def db_cleanup(session):
         log.verbose('Removed %d series without episodes.', result)
 
 
-@event('manager.startup')
+@event('manager.lock_acquired')
 def repair(manager):
-    """Perform database repairing and upgrading at startup."""
+    # Perform database repairing and upgrading at startup.
     if not manager.persist.get('series_repaired', False):
         session = Session()
-        # For some reason at least I have some releases in database which don't belong to any episode.
-        for release in session.query(Release).filter(Release.episode == None).all():
-            log.info('Purging orphan release %s from database', release.title)
-            session.delete(release)
-        session.commit()
+        try:
+            # For some reason at least I have some releases in database which don't belong to any episode.
+            for release in session.query(Release).filter(Release.episode == None).all():
+                log.info('Purging orphan release %s from database', release.title)
+                session.delete(release)
+            session.commit()
+        finally:
+            session.close()
         manager.persist['series_repaired'] = True
+
+    # Run clean_series the first time we get a database lock, since we won't have had one the first time the config
+    # got loaded.
+    clean_series(manager)
+
+
+@event('manager.config_updated')
+def clean_series(manager):
+    # Unmark series from tasks which have been deleted.
+    if not manager.has_lock:
+        return
+    session = Session()
+    try:
+        deleted = (session.query(SeriesTask).filter(not_(SeriesTask.name.in_(manager.tasks))).
+                   delete(synchronize_session=False))
+        if deleted:
+            session.commit()
+    finally:
+        session.close()
 
 
 TRANSLATE_MAP = {ord(u'&'): u' and '}
@@ -362,176 +383,184 @@ class SeriesTask(Base):
         self.name = name
 
 
-class SeriesDatabase(object):
+def get_latest_episode(series):
+    """Return latest known identifier in dict (season, episode, name) for series name"""
+    session = Session.object_session(series)
+    episode = session.query(Episode).join(Episode.series).\
+        filter(Series.id == series.id).\
+        filter(Episode.season != None).\
+        order_by(desc(Episode.season)).\
+        order_by(desc(Episode.number)).first()
+    if not episode:
+        # log.trace('get_latest_info: no info available for %s', name)
+        return False
+    # log.trace('get_latest_info, series: %s season: %s episode: %s' % \
+    #    (name, episode.season, episode.number))
+    return episode
 
-    """Provides API to series database"""
 
-    def get_latest_episode(self, series):
-        """Return latest known identifier in dict (season, episode, name) for series name"""
-        session = Session.object_session(series)
-        episode = session.query(Episode).join(Episode.series).\
-            filter(Series.id == series.id).\
-            filter(Episode.season != None).\
-            order_by(desc(Episode.season)).\
-            order_by(desc(Episode.number)).first()
-        if not episode:
-            # log.trace('get_latest_info: no info available for %s', name)
-            return False
-        # log.trace('get_latest_info, series: %s season: %s episode: %s' % \
-        #    (name, episode.season, episode.number))
-        return episode
+def auto_identified_by(series):
+    """
+    Determine if series `name` should be considered identified by episode or id format
 
-    def auto_identified_by(self, series):
-        """
-        Determine if series `name` should be considered identified by episode or id format
+    Returns 'ep', 'sequence', 'date' or 'id' if enough history is present to identify the series' id type.
+    Returns 'auto' if there is not enough history to determine the format yet
+    """
 
-        Returns 'ep', 'sequence', 'date' or 'id' if enough history is present to identify the series' id type.
-        Returns 'auto' if there is not enough history to determine the format yet
-        """
-
-        session = Session.object_session(series)
-        type_totals = dict(session.query(Episode.identified_by, func.count(Episode.identified_by)).join(Episode.series).
-                           filter(Series.id == series.id).group_by(Episode.identified_by).all())
-        # Remove None and specials from the dict,
-        # we are only considering episodes that we know the type of (parsed with new parser)
-        type_totals.pop(None, None)
-        type_totals.pop('special', None)
-        if not type_totals:
-            return 'auto'
-        log.debug('%s episode type totals: %r', series.name, type_totals)
-        # Find total number of parsed episodes
-        total = sum(type_totals.itervalues())
-        # See which type has the most
-        best = max(type_totals, key=lambda x: type_totals[x])
-
-        # Ep mode locks in faster than the rest. At 2 seen episodes.
-        if type_totals.get('ep', 0) >= 2 and type_totals['ep'] > total / 3:
-            log.info('identified_by has locked in to type `ep` for %s', series.name)
-            return 'ep'
-        # If we have over 3 episodes all of the same type, lock in
-        if len(type_totals) == 1 and total >= 3:
-            return best
-        # Otherwise wait until 5 episodes to lock in
-        if total >= 5:
-            log.info('identified_by has locked in to type `%s` for %s', best, series.name)
-            return best
-        log.verbose('identified by is currently on `auto` for %s. '
-                    'Multiple id types may be accepted until it locks in on the appropriate type.', series.name)
+    session = Session.object_session(series)
+    type_totals = dict(session.query(Episode.identified_by, func.count(Episode.identified_by)).join(Episode.series).
+                       filter(Series.id == series.id).group_by(Episode.identified_by).all())
+    # Remove None and specials from the dict,
+    # we are only considering episodes that we know the type of (parsed with new parser)
+    type_totals.pop(None, None)
+    type_totals.pop('special', None)
+    if not type_totals:
         return 'auto'
+    log.debug('%s episode type totals: %r', series.name, type_totals)
+    # Find total number of parsed episodes
+    total = sum(type_totals.itervalues())
+    # See which type has the most
+    best = max(type_totals, key=lambda x: type_totals[x])
 
-    def get_latest_download(self, series):
-        """
-        :param Series series: SQLAlchemy session
-        :return: Instance of Episode or None if not found.
-        """
-        session = Session.object_session(series)
-        downloaded = session.query(Episode).join(Episode.releases, Episode.series).\
-            filter(Series.id == series.id).\
-            filter(Release.downloaded == True)
-        if series.identified_by and series.identified_by != 'auto':
-            downloaded = downloaded.filter(Episode.identified_by == series.identified_by)
-        if series.identified_by in ['ep', 'sequence']:
-            latest_download = downloaded.order_by(desc(Episode.season), desc(Episode.number)).first()
-        elif series.identified_by == 'date':
-            latest_download = downloaded.order_by(desc(Episode.identifier)).first()
-        else:
-            latest_download = downloaded.order_by(desc(Episode.first_seen)).first()
+    # Ep mode locks in faster than the rest. At 2 seen episodes.
+    if type_totals.get('ep', 0) >= 2 and type_totals['ep'] > total / 3:
+        log.info('identified_by has locked in to type `ep` for %s', series.name)
+        return 'ep'
+    # If we have over 3 episodes all of the same type, lock in
+    if len(type_totals) == 1 and total >= 3:
+        return best
+    # Otherwise wait until 5 episodes to lock in
+    if total >= 5:
+        log.info('identified_by has locked in to type `%s` for %s', best, series.name)
+        return best
+    log.verbose('identified by is currently on `auto` for %s. '
+                'Multiple id types may be accepted until it locks in on the appropriate type.', series.name)
+    return 'auto'
 
-        if not latest_download:
-            log.debug('get_latest_download returning None, no downloaded episodes found for: %s', series.name)
-            return
 
-        return latest_download
+def get_latest_release(series, downloaded=True, season=None):
+    """
+    :param Series series: SQLAlchemy session
+    :param Downloaded: find only downloaded releases
+    :param Season: season to find newest release for
+    :return: Instance of Episode or None if not found.
+    """
+    session = Session.object_session(series)
+    releases = session.query(Episode).join(Episode.releases, Episode.series).filter(Series.id == series.id)
 
-    def new_eps_after(self, since_ep):
-        """
-        :param since_ep: Episode instance
-        :return: Number of episodes since then
-        """
-        session = Session.object_session(since_ep)
-        series = since_ep.series
-        series_eps = session.query(Episode).join(Episode.series).\
-            filter(Series.id == series.id)
-        if series.identified_by == 'ep':
-            if since_ep.season is None or since_ep.number is None:
-                log.debug('new_eps_after for %s falling back to timestamp because latest dl in non-ep format' %
-                          series.name)
-                return series_eps.filter(Episode.first_seen > since_ep.first_seen).count()
-            return series_eps.filter((Episode.identified_by == 'ep') &
-                                     (((Episode.season == since_ep.season) & Episode.number > since_ep.number) |
-                                      Episode.season > since_ep.season)).count()
-        elif series.identified_by == 'seq':
-            return series_eps.filter(Episode.number > since_ep.number).count()
-        elif series.identified_by == 'id':
+    if downloaded:
+        releases = releases.filter(Release.downloaded == True)
+
+    if season is not None:
+        releases = releases.filter(Episode.season == season)
+
+    if series.identified_by and series.identified_by != 'auto':
+        releases = releases.filter(Episode.identified_by == series.identified_by)
+
+    if series.identified_by in ['ep', 'sequence']:
+        latest_release = releases.order_by(desc(Episode.season), desc(Episode.number)).first()
+    elif series.identified_by == 'date':
+        latest_release = releases.order_by(desc(Episode.identifier)).first()
+    else:
+        latest_release = releases.order_by(desc(Episode.first_seen)).first()
+
+    if not latest_release:
+        log.debug('get_latest_release returning None, no downloaded episodes found for: %s', series.name)
+        return
+
+    return latest_release
+
+
+def new_eps_after(since_ep):
+    """
+    :param since_ep: Episode instance
+    :return: Number of episodes since then
+    """
+    session = Session.object_session(since_ep)
+    series = since_ep.series
+    series_eps = session.query(Episode).join(Episode.series).\
+        filter(Series.id == series.id)
+    if series.identified_by == 'ep':
+        if since_ep.season is None or since_ep.number is None:
+            log.debug('new_eps_after for %s falling back to timestamp because latest dl in non-ep format' %
+                      series.name)
             return series_eps.filter(Episode.first_seen > since_ep.first_seen).count()
-        else:
-            log.debug('unsupported identified_by %s', series.identified_by)
-            return 0
+        return series_eps.filter((Episode.identified_by == 'ep') &
+                                 (((Episode.season == since_ep.season) & Episode.number > since_ep.number) |
+                                  Episode.season > since_ep.season)).count()
+    elif series.identified_by == 'seq':
+        return series_eps.filter(Episode.number > since_ep.number).count()
+    elif series.identified_by == 'id':
+        return series_eps.filter(Episode.first_seen > since_ep.first_seen).count()
+    else:
+        log.debug('unsupported identified_by %s', series.identified_by)
+        return 0
 
-    def store(self, session, parser, series=None):
-        """
-        Push series information into database. Returns added/existing release.
 
-        :param session: Database session to use
-        :param parser: parser for release that should be added to database
-        :param series: Series in database to add release to. Will be looked up if not provided.
-        :return: List of Releases
-        """
+def store_parser(session, parser, series=None):
+    """
+    Push series information into database. Returns added/existing release.
+
+    :param session: Database session to use
+    :param parser: parser for release that should be added to database
+    :param series: Series in database to add release to. Will be looked up if not provided.
+    :return: List of Releases
+    """
+    if not series:
+        # if series does not exist in database, add new
+        series = session.query(Series).\
+            filter(Series.name == parser.name).\
+            filter(Series.id != None).first()
         if not series:
-            # if series does not exist in database, add new
-            series = session.query(Series).\
-                filter(Series.name == parser.name).\
-                filter(Series.id != None).first()
-            if not series:
-                log.debug('adding series %s into db', parser.name)
-                series = Series()
-                series.name = parser.name
-                session.add(series)
-                log.debug('-> added %s' % series)
+            log.debug('adding series %s into db', parser.name)
+            series = Series()
+            series.name = parser.name
+            session.add(series)
+            log.debug('-> added %s' % series)
 
-        releases = []
-        for ix, identifier in enumerate(parser.identifiers):
-            # if episode does not exist in series, add new
-            episode = session.query(Episode).filter(Episode.series_id == series.id).\
-                filter(Episode.identifier == identifier).\
-                filter(Episode.series_id != None).first()
-            if not episode:
-                log.debug('adding episode %s into series %s', identifier, parser.name)
-                episode = Episode()
-                episode.identifier = identifier
-                episode.identified_by = parser.id_type
-                # if episodic format
-                if parser.id_type == 'ep':
-                    episode.season = parser.season
-                    episode.number = parser.episode + ix
-                elif parser.id_type == 'sequence':
-                    episode.season = 0
-                    episode.number = parser.id + ix
-                series.episodes.append(episode)  # pylint:disable=E1103
-                log.debug('-> added %s' % episode)
+    releases = []
+    for ix, identifier in enumerate(parser.identifiers):
+        # if episode does not exist in series, add new
+        episode = session.query(Episode).filter(Episode.series_id == series.id).\
+            filter(Episode.identifier == identifier).\
+            filter(Episode.series_id != None).first()
+        if not episode:
+            log.debug('adding episode %s into series %s', identifier, parser.name)
+            episode = Episode()
+            episode.identifier = identifier
+            episode.identified_by = parser.id_type
+            # if episodic format
+            if parser.id_type == 'ep':
+                episode.season = parser.season
+                episode.number = parser.episode + ix
+            elif parser.id_type == 'sequence':
+                episode.season = 0
+                episode.number = parser.id + ix
+            series.episodes.append(episode)  # pylint:disable=E1103
+            log.debug('-> added %s' % episode)
 
-            # if release does not exists in episode, add new
-            #
-            # NOTE:
-            #
-            # filter(Release.episode_id != None) fixes weird bug where release had/has been added
-            # to database but doesn't have episode_id, this causes all kinds of havoc with the plugin.
-            # perhaps a bug in sqlalchemy?
-            release = session.query(Release).filter(Release.episode_id == episode.id).\
-                filter(Release.title == parser.data).\
-                filter(Release.quality == parser.quality).\
-                filter(Release.proper_count == parser.proper_count).\
-                filter(Release.episode_id != None).first()
-            if not release:
-                log.debug('adding release %s into episode', parser)
-                release = Release()
-                release.quality = parser.quality
-                release.proper_count = parser.proper_count
-                release.title = parser.data
-                episode.releases.append(release)  # pylint:disable=E1103
-                log.debug('-> added %s' % release)
-            releases.append(release)
-        return releases
+        # if release does not exists in episode, add new
+        #
+        # NOTE:
+        #
+        # filter(Release.episode_id != None) fixes weird bug where release had/has been added
+        # to database but doesn't have episode_id, this causes all kinds of havoc with the plugin.
+        # perhaps a bug in sqlalchemy?
+        release = session.query(Release).filter(Release.episode_id == episode.id).\
+            filter(Release.title == parser.data).\
+            filter(Release.quality == parser.quality).\
+            filter(Release.proper_count == parser.proper_count).\
+            filter(Release.episode_id != None).first()
+        if not release:
+            log.debug('adding release %s into episode', parser)
+            release = Release()
+            release.quality = parser.quality
+            release.proper_count = parser.proper_count
+            release.title = parser.data
+            episode.releases.append(release)  # pylint:disable=E1103
+            log.debug('-> added %s' % release)
+        releases.append(release)
+    return releases
 
 
 def set_series_begin(series, ep_id):
@@ -547,7 +576,7 @@ def set_series_begin(series, ep_id):
     session = Session.object_session(series)
     if isinstance(ep_id, int):
         identified_by = 'sequence'
-    elif re.match(r'(?i)^S\d{1,2}E\d{1,2}$', ep_id):
+    elif re.match(r'(?i)^S\d{1,4}E\d{1,2}$', ep_id):
         identified_by = 'ep'
         ep_id = ep_id.upper()
     elif re.match(r'\d{4}-\d{2}-\d{2}', ep_id):
@@ -588,32 +617,38 @@ def set_series_begin(series, ep_id):
 def forget_series(name):
     """Remove a whole series `name` from database."""
     session = Session()
-    series = session.query(Series).filter(Series.name == name).all()
-    if series:
-        for s in series:
-            session.delete(s)
-        session.commit()
-        log.debug('Removed series %s from database.', name)
-    else:
-        raise ValueError('Unknown series %s' % name)
+    try:
+        series = session.query(Series).filter(Series.name == name).all()
+        if series:
+            for s in series:
+                session.delete(s)
+            session.commit()
+            log.debug('Removed series %s from database.', name)
+        else:
+            raise ValueError('Unknown series %s' % name)
+    finally:
+        session.close()
 
 
 def forget_series_episode(name, identifier):
     """Remove all episodes by `identifier` from series `name` from database."""
     session = Session()
-    series = session.query(Series).filter(Series.name == name).first()
-    if series:
-        episode = session.query(Episode).filter(Episode.identifier == identifier).\
-            filter(Episode.series_id == series.id).first()
-        if episode:
-            series.identified_by = ''  # reset identified_by flag so that it will be recalculated
-            session.delete(episode)
-            session.commit()
-            log.debug('Episode %s from series %s removed from database.', identifier, name)
+    try:
+        series = session.query(Series).filter(Series.name == name).first()
+        if series:
+            episode = session.query(Episode).filter(Episode.identifier == identifier).\
+                filter(Episode.series_id == series.id).first()
+            if episode:
+                series.identified_by = ''  # reset identified_by flag so that it will be recalculated
+                session.delete(episode)
+                session.commit()
+                log.debug('Episode %s from series %s removed from database.', identifier, name)
+            else:
+                raise ValueError('Unknown identifier %s for series %s' % (identifier, name.capitalize()))
         else:
-            raise ValueError('Unknown identifier %s for series %s' % (identifier, name.capitalize()))
-    else:
-        raise ValueError('Unknown series %s' % name)
+            raise ValueError('Unknown series %s' % name)
+    finally:
+        session.close()
 
 
 def populate_entry_fields(entry, parser):
@@ -642,7 +677,7 @@ def populate_entry_fields(entry, parser):
 class FilterSeriesBase(object):
     """
     Class that contains helper methods for both filter.series as well as plugins that configure it,
-    such as all_series, series_premiere and import_series.
+    such as all_series, series_premiere and configure_series.
     """
 
     @property
@@ -690,7 +725,11 @@ class FilterSeriesBase(object):
                     ]
                 },
                 'from_group': one_or_more({'type': 'string'}),
-                'parse_only': {'type': 'boolean'}
+                'parse_only': {'type': 'boolean'},
+                'special_ids': one_or_more({'type': 'string'}),
+                'prefer_specials': {'type': 'boolean'},
+                'assume_special': {'type': 'boolean'},
+                'tracking': {'type': ['boolean', 'string'], 'enum': [True, False, 'backfill']}
             },
             'additionalProperties': False
         }
@@ -800,20 +839,7 @@ class FilterSeriesBase(object):
         return task.config['series']
 
 
-@event('manager.execute.started')
-def remove_old_tasks(manager):
-    """Unmark series from tasks which have been deleted"""
-    session = Session()
-    try:
-        deleted = (session.query(SeriesTask).filter(not_(SeriesTask.name.in_(manager.config['tasks']))).
-                   delete(synchronize_session=False))
-        if deleted:
-            session.commit()
-    finally:
-        session.close()
-
-
-class FilterSeries(SeriesDatabase, FilterSeriesBase):
+class FilterSeries(FilterSeriesBase):
     """
     Intelligent filter for tv-series.
 
@@ -852,12 +878,9 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
         }
 
     def __init__(self):
-        self.backlog = None
-
-    def on_process_start(self, task):
         try:
-            self.backlog = get_plugin_by_name('backlog').instance
-        except DependencyError:
+            self.backlog = plugin.get_plugin_by_name('backlog')
+        except plugin.DependencyError:
             log.warning('Unable utilize backlog plugin, episodes may slip trough timeframe')
 
     def auto_exact(self, config):
@@ -879,9 +902,9 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
                         series_config['exact'] = True
 
     # Run after metainfo_quality and before metainfo_series
-    @priority(125)
-    def on_task_metainfo(self, task):
-        config = self.prepare_config(task.config.get('series', {}))
+    @plugin.priority(125)
+    def on_task_metainfo(self, task, config):
+        config = self.prepare_config(config)
         self.auto_exact(config)
         for series_item in config:
             series_name, series_config = series_item.items()[0]
@@ -891,16 +914,16 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
             took = time.clock() - start_time
             log.trace('parsing %s took %s', series_name, took)
 
-    def on_task_filter(self, task):
+    def on_task_filter(self, task, config):
         """Filter series"""
         # Parsing was done in metainfo phase, create the dicts to pass to process_series from the task entries
         # key: series episode identifier ie. S01E02
         # value: seriesparser
 
-        config = self.prepare_config(task.config.get('series', {}))
+        config = self.prepare_config(config)
         found_series = {}
         for entry in task.entries:
-            if entry.get('series_name') and entry.get('series_id') and entry.get('series_parser'):
+            if entry.get('series_name') and entry.get('series_id') is not None and entry.get('series_parser'):
                 found_series.setdefault(entry['series_name'], []).append(entry)
 
         for series_item in config:
@@ -923,10 +946,12 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
             series_entries = {}
             for entry in found_series[series_name]:
                 # store found episodes into database and save reference for later use
-                releases = self.store(task.session, entry['series_parser'], series=db_series)
+                releases = store_parser(task.session, entry['series_parser'], series=db_series)
                 entry['series_releases'] = releases
                 series_entries.setdefault(releases[0].episode, []).append(entry)
 
+                # TODO: Unfortunately we are setting these again, even though they were set in metanifo. This is for the
+                # benefit of all_series and series_premiere. Figure a better way.
                 # set custom download path
                 if 'path' in series_config:
                     log.debug('setting %s custom path to %s', entry['title'], series_config.get('path'))
@@ -935,7 +960,7 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
 
                 # accept info from set: and place into the entry
                 if 'set' in series_config:
-                    set = get_plugin_by_name('set')
+                    set = plugin.get_plugin_by_name('set')
                     set.instance.modify(entry, series_config.get('set'))
 
             # If we didn't find any episodes for this series, continue
@@ -948,7 +973,7 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
                 db_series.identified_by = series_config['identified_by']
             # if series doesn't have identified_by flag already set, calculate one now that new eps are added to db
             if not db_series.identified_by or db_series.identified_by == 'auto':
-                db_series.identified_by = self.auto_identified_by(db_series)
+                db_series.identified_by = auto_identified_by(db_series)
                 log.debug('identified_by set to \'%s\' based on series history', db_series.identified_by)
 
             log.trace('series_name: %s series_config: %s', series_name, series_config)
@@ -993,7 +1018,10 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
                       strict_name=config.get('exact', False),
                       allow_groups=get_as_array(config, 'from_group'),
                       date_yearfirst=config.get('date_yearfirst'),
-                      date_dayfirst=config.get('date_dayfirst'))
+                      date_dayfirst=config.get('date_dayfirst'),
+                      special_ids=get_as_array(config, 'special_ids'),
+                      prefer_specials=config.get('prefer_specials'),
+                      assume_special=config.get('assume_special'))
         for id_type in ID_TYPES:
             params[id_type + '_regexps'] = get_as_array(config, id_type + '_regexp')
 
@@ -1027,6 +1055,17 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
 
             log.debug('%s detected as %s, field: %s', entry['title'], parser, parser.field)
             populate_entry_fields(entry, parser)
+
+            # set custom download path
+            if 'path' in config:
+                log.debug('setting %s custom path to %s', entry['title'], config.get('path'))
+                # Just add this to the 'set' dictionary, so that string replacement is done cleanly
+                config.setdefault('set', {}).update(path=config['path'])
+
+            # accept info from set: and place into the entry
+            if 'set' in config:
+                set = plugin.get_plugin_by_name('set')
+                set.instance.modify(entry, config.get('set'))
 
     def process_series(self, task, series_entries, config):
         """
@@ -1121,14 +1160,15 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
             log.debug('continuing w. episodes: %s', [e['title'] for e in entries])
             log.debug('best episode is: %s', best['title'])
 
-            # episode advancement. used only with season and sequence based series
+            # episode tracking. used only with season and sequence based series
             if ep.identified_by in ['ep', 'sequence']:
-                if task.manager.options.disable_advancement:
-                    log.debug('episode advancement disabled')
+                if task.options.disable_tracking or not config.get('tracking', True):
+                    log.debug('episode tracking disabled')
                 else:
-                    log.debug('-' * 20 + ' episode advancement -->')
+                    log.debug('-' * 20 + ' episode tracking -->')
                     # Grace is number of distinct eps in the task for this series + 2
-                    if self.process_episode_advancement(ep, entries, grace=len(series_entries)+2):
+                    backfill = config.get('tracking') == 'backfill'
+                    if self.process_episode_tracking(ep, entries, grace=len(series_entries)+2, backfill=backfill):
                         continue
 
             # quality
@@ -1243,17 +1283,27 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
             log.debug('no quality meets requirements')
         return result
 
-    def process_episode_advancement(self, episode, entries, grace):
-        """Rejects all episodes that are too old or new (advancement), return True when this happens."""
+    def process_episode_tracking(self, episode, entries, grace, backfill=False):
+        """
+        Rejects all episodes that are too old or new, return True when this happens.
 
-        latest = self.get_latest_download(episode.series)
+        :param episode: Episode model
+        :param list entries: List of entries for given episode.
+        :param int grace: Number of episodes before or after latest download that are allowed.
+        :param bool backfill: If this is True, previous episodes will be allowed,
+            but forward advancement will still be restricted.
+        """
+
+        latest = get_latest_release(episode.series)
+        if episode.series.begin and episode.series.begin > latest:
+            latest = episode.series.begin
         log.debug('latest download: %s' % latest)
         log.debug('current: %s' % episode)
 
         if latest and latest.identified_by == episode.identified_by:
             # Allow any previous episodes this season, or previous episodes within grace if sequence mode
-            if (episode.season < latest.season or
-                    (episode.identified_by == 'sequence' and episode.number < (latest.number - grace))):
+            if (not backfill and (episode.season < latest.season or
+                    (episode.identified_by == 'sequence' and episode.number < (latest.number - grace)))):
                 log.debug('too old! rejecting all occurrences')
                 for entry in entries:
                     entry.reject('Too much in the past from latest downloaded episode %s' % latest.identifier)
@@ -1265,7 +1315,7 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
                 log.debug('too new! rejecting all occurrences')
                 for entry in entries:
                     entry.reject('Too much in the future from latest downloaded episode %s. '
-                                 'See `--disable-advancement` if this should be downloaded.' % latest.identifier)
+                                 'See `--disable-tracking` if this should be downloaded.' % latest.identifier)
                 return True
 
     def process_timeframe(self, task, config, episode, entries):
@@ -1295,7 +1345,7 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
         expires = first_seen + timeframe
         log.debug('timeframe: %s, first_seen: %s, expires: %s', timeframe, first_seen, expires)
 
-        stop = task.manager.options.stop_waiting.lower() == episode.series.name.lower()
+        stop = task.options.stop_waiting.lower() == episode.series.name.lower()
         if expires <= datetime.now() or stop:
             # Expire timeframe, accept anything
             log.info('Timeframe expired, releasing quality restriction.')
@@ -1313,7 +1363,7 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
 
             # add best entry to backlog (backlog is able to handle duplicate adds)
             if self.backlog:
-                self.backlog.add_backlog(task, best)
+                self.backlog.instance.add_backlog(task, best)
             return True
 
     def process_qualities(self, config, entries, downloaded):
@@ -1359,9 +1409,9 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
                 still_needed = [req for req in still_needed if not req.allows(quality)]
         return bool(downloaded_qualities)
 
-    def on_task_exit(self, task):
+    def on_task_learn(self, task, config):
         """Learn succeeded episodes"""
-        log.debug('on_task_exit')
+        log.debug('on_task_learn')
         for entry in task.accepted:
             if 'series_releases' in entry:
                 for release in entry['series_releases']:
@@ -1374,7 +1424,7 @@ class FilterSeries(SeriesDatabase, FilterSeriesBase):
 class SeriesDBManager(FilterSeriesBase):
     """Update in the database with series info from the config"""
 
-    @priority(0)
+    @plugin.priority(0)
     def on_task_start(self, task, config):
         if not task.config_modified:
             return
@@ -1405,14 +1455,23 @@ class SeriesDBManager(FilterSeriesBase):
                 try:
                     set_series_begin(db_series, series_config['begin'])
                 except ValueError as e:
-                    raise PluginError(e)
+                    raise plugin.PluginError(e)
 
 
-# Register plugin
-register_plugin(FilterSeries, 'series')
-# This is a builtin so that it can update the database for tasks that may have had series plugin removed
-register_plugin(SeriesDBManager, 'series_db', builtin=True, api_ver=2)
-register_parser_option('--stop-waiting', action='store', dest='stop_waiting', default='',
-                       metavar='NAME', help='Stop timeframe for a given series.')
-register_parser_option('--disable-advancement', action='store_true', dest='disable_advancement', default=False,
-                       help='Disable episode advancement for this run.')
+@event('plugin.register')
+def register_plugin():
+    plugin.register(FilterSeries, 'series', api_ver=2)
+    # This is a builtin so that it can update the database for tasks that may have had series plugin removed
+    plugin.register(SeriesDBManager, 'series_db', builtin=True, api_ver=2)
+
+
+@event('options.register')
+def register_parser_arguments():
+    exec_parser = options.get_parser('execute')
+    exec_parser.add_argument('--stop-waiting', action='store', dest='stop_waiting', default='',
+                             metavar='NAME', help='stop timeframe for a given series')
+    exec_parser.add_argument('--disable-tracking', action='store_true', default=False,
+                             help='disable episode advancement for this run')
+    # Backwards compatibility
+    exec_parser.add_argument('--disable-advancement', action='store_true', dest='disable_tracking',
+                             help=argparse.SUPPRESS)

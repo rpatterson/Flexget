@@ -2,7 +2,7 @@ from __future__ import unicode_literals, division, absolute_import
 from datetime import datetime, timedelta
 
 from flexget.entry import Entry
-from flexget.plugin import register_plugin
+from flexget import plugin
 import flexget.validator
 from tests import FlexGetBase
 
@@ -16,7 +16,7 @@ class SearchPlugin(object):
     def search(self, entry, comparator=None, config=None):
         return [Entry(entry)]
 
-register_plugin(SearchPlugin, 'test_search', groups=['search'])
+plugin.register(SearchPlugin, 'test_search', groups=['search'], api_ver=2)
 
 
 class EstRelease(object):
@@ -25,7 +25,7 @@ class EstRelease(object):
     def estimate(self, entry):
         return entry.get('est_release')
 
-register_plugin(EstRelease, 'test_release', groups=['estimate_release'])
+plugin.register(EstRelease, 'test_release', groups=['estimate_release'], api_ver=2)
 
 
 class TestDiscover(FlexGetBase):
@@ -60,6 +60,18 @@ class TestDiscover(FlexGetBase):
                 - title: Foo
               from:
               - test_search: yes
+          test_emit_series:
+            discover:
+              ignore_estimations: yes
+              what:
+              - emit_series:
+                  from_start: yes
+              from:
+              - test_search: yes
+            series:
+            - My Show:
+                identified_by: ep
+            rerun: 0
 
     """
 
@@ -95,3 +107,37 @@ class TestDiscover(FlexGetBase):
         mock_config[0]['est_release'] = datetime.now()
         self.execute_task('test_estimates')
         assert len(self.task.entries) == 1
+
+    def test_emit_series(self):
+        self.execute_task('test_emit_series')
+        assert self.task.find_entry(title='My Show S01E01')
+
+class TestEmitSeriesInDiscover(FlexGetBase):
+    __yaml__ = """
+        tasks:
+          inject_series:
+            series:
+              - My Show 2
+          test_emit_series_backfill:
+            discover:
+              ignore_estimations: yes
+              what:
+              - emit_series:
+                  backfill: yes
+              from:
+              - test_search: yes
+            series:
+            - My Show 2:
+                tracking: backfill
+                identified_by: ep
+            rerun: 0
+    """
+
+    def inject_series(self, release_name):
+        self.execute_task('inject_series', options = {'inject': [Entry(title=release_name, url='')]})
+
+    def test_emit_series_backfill(self):
+        self.inject_series('My Show 2 S02E01')
+        self.execute_task('test_emit_series_backfill')
+        assert self.task.find_entry(title='My Show 2 S01E01')
+        assert self.task.find_entry(title='My Show 2 S02E02')

@@ -1,21 +1,17 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
-from flexget.plugin import register_plugin, DependencyError, PluginError
+
+from flexget import plugin
+from flexget.event import event
 from flexget.utils.log import log_once
 
 try:
-    from flexget.plugins.api_rottentomatoes import lookup_movie
+    from flexget.plugins.api_rottentomatoes import lookup_movie, API_KEY
 except ImportError:
-    raise DependencyError(issued_by='rottentomatoes_lookup', missing='api_rottentomatoes',
+    raise plugin.DependencyError(issued_by='rottentomatoes_lookup', missing='api_rottentomatoes',
                           message='rottentomatoes_lookup requires the `api_rottentomatoes` plugin')
 
 log = logging.getLogger('rottentomatoes_lookup')
-
-
-def get_imdb_id(movie):
-    for alt_id in movie.alternate_ids:
-        if alt_id.name == 'imdb':
-            return 'tt' + alt_id.id
 
 
 def get_rt_url(movie):
@@ -35,7 +31,6 @@ class PluginRottenTomatoesLookup(object):
     field_map = {
         'rt_name': 'title',
         'rt_id': 'id',
-        'imdb_id': get_imdb_id,
         'rt_year': 'year',
         'rt_genres': lambda movie: [genre.name for genre in movie.genres],
         'rt_mpaa_rating': 'mpaa_rating',
@@ -60,9 +55,10 @@ class PluginRottenTomatoesLookup(object):
         'movie_name': 'title',
         'movie_year': 'year'}
 
-    def validator(self):
-        from flexget import validator
-        return validator.factory('boolean')
+    schema = {'oneOf': [
+        {'type': 'boolean'},
+        {'type': 'string', 'description': 'provide a custom api key'}
+    ]}
 
     def lazy_loader(self, entry, field):
         """Does the lookup for this entry and populates the entry fields.
@@ -73,31 +69,50 @@ class PluginRottenTomatoesLookup(object):
 
         """
         try:
-            self.lookup(entry)
-        except PluginError as e:
+            self.lookup(entry, key=self.key)
+        except plugin.PluginError as e:
             log_once(e.value.capitalize(), logger=log)
             # Set all of our fields to None if the lookup failed
             entry.unregister_lazy_fields(self.field_map, self.lazy_loader)
         return entry[field]
 
-    def lookup(self, entry, search_allowed=True):
+    def lookup(self, entry, search_allowed=True, key=None):
         """
         Perform Rotten Tomatoes lookup for entry.
 
         :param entry: Entry instance
         :param search_allowed: Allow fallback to search
+        :param key: optionally specify an API key to use
         :raises PluginError: Failure reason
         """
+        if not key:
+            key = API_KEY
         movie = lookup_movie(smart_match=entry['title'],
                              rottentomatoes_id=entry.get('rt_id', eval_lazy=False),
-                             only_cached=(not search_allowed))
+                             only_cached=(not search_allowed),
+                             api_key=key
+                             )
         log.debug(u'Got movie: %s' % movie)
         entry.update_using_map(self.field_map, movie)
+        
+        if not entry.get('imdb_id', eval_lazy=False):
+            for alt_id in movie.alternate_ids:
+                if alt_id.name == 'imdb':
+                    entry['imdb_id'] = 'tt' + alt_id.id
+                    break
 
     def on_task_metainfo(self, task, config):
         if not config:
             return
+
+        if isinstance(config, basestring):
+            self.key = config.lower()
+        else:
+            self.key = None
+
         for entry in task.entries:
             entry.register_lazy_fields(self.field_map, self.lazy_loader)
 
-register_plugin(PluginRottenTomatoesLookup, 'rottentomatoes_lookup', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(PluginRottenTomatoesLookup, 'rottentomatoes_lookup', api_ver=2)

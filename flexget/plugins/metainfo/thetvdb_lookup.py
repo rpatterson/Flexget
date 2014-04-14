@@ -1,12 +1,14 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
-from flexget.plugin import register_plugin, DependencyError, priority
+
+from flexget import plugin
+from flexget.event import event
 
 try:
     from flexget.plugins.api_tvdb import lookup_series, lookup_episode, get_mirror
 except ImportError:
-    raise DependencyError(issued_by='thetvdb_lookup', missing='api_tvdb',
-                          message='thetvdb_lookup requires the `api_tvdb` plugin')
+    raise plugin.DependencyError(issued_by='thetvdb_lookup', missing='api_tvdb',
+                                 message='thetvdb_lookup requires the `api_tvdb` plugin')
 
 log = logging.getLogger('thetvdb_lookup')
 
@@ -33,6 +35,7 @@ class PluginThetvdbLookup(object):
       tvdb_content_rating
       tvdb_genres
       tvdb_network
+      tvdb_overview
       tvdb_banner_url
       tvdb_fanart_url
       tvdb_poster_url
@@ -63,6 +66,7 @@ class PluginThetvdbLookup(object):
         'tvdb_content_rating': 'contentrating',
         'tvdb_genres': 'genre',
         'tvdb_network': 'network',
+        'tvdb_overview': 'overview',
         'tvdb_banner_url': lambda series: series.banner and get_mirror('banner') + series.banner,
         'tvdb_fanart_url': lambda series: series.fanart and get_mirror('banner') + series.fanart,
         'tvdb_poster_url': lambda series: series.poster and get_mirror('banner') + series.poster,
@@ -97,7 +101,7 @@ class PluginThetvdbLookup(object):
             series = lookup_series(entry.get('series_name', eval_lazy=False), tvdb_id=entry.get('tvdb_id', eval_lazy=False))
             entry.update_using_map(self.series_map, series)
         except LookupError as e:
-            log.debug('Error looking up tvdb series information for %s: %s' % (entry['title'], e.message))
+            log.debug('Error looking up tvdb series information for %s: %s' % (entry['title'], e.args[0]))
             entry.unregister_lazy_fields(self.series_map, self.lazy_series_lookup)
             # Also clear episode fields, since episode lookup cannot succeed without series lookup
             entry.unregister_lazy_fields(self.episode_map, self.lazy_episode_lookup)
@@ -129,13 +133,13 @@ class PluginThetvdbLookup(object):
             episode = lookup_episode(**lookupargs)
             entry.update_using_map(self.episode_map, episode)
         except LookupError as e:
-            log.debug('Error looking up tvdb episode information for %s: %s' % (entry['title'], e.message))
+            log.debug('Error looking up tvdb episode information for %s: %s' % (entry['title'], e.args[0]))
             entry.unregister_lazy_fields(self.episode_map, self.lazy_episode_lookup)
 
         return entry[field]
 
     # Run after series and metainfo series
-    @priority(110)
+    @plugin.priority(110)
     def on_task_metainfo(self, task, config):
         if not config:
             return
@@ -151,4 +155,6 @@ class PluginThetvdbLookup(object):
                 # TODO: lookup for 'seq' and 'date' type series
 
 
-register_plugin(PluginThetvdbLookup, 'thetvdb_lookup', api_ver=2)
+@event('plugin.register')
+def register_plugin():
+    plugin.register(PluginThetvdbLookup, 'thetvdb_lookup', api_ver=2)
