@@ -1,5 +1,6 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
+import urllib
 
 from requests import RequestException
 
@@ -7,11 +8,7 @@ from flexget import plugin
 from flexget.event import event
 from flexget.utils.template import RenderError
 
-__version__ = 0.1
-
 log = logging.getLogger('prowl')
-
-headers = {'User-Agent': 'FlexGet Prowl plugin/%s' % str(__version__)}
 
 
 class OutputProwl(object):
@@ -29,30 +26,22 @@ class OutputProwl(object):
 
     Configuration parameters are also supported from entries (eg. through set).
     """
-
-    def validator(self):
-        from flexget import validator
-        config = validator.factory('dict')
-        config.accept('text', key='apikey', required=True)
-        config.accept('text', key='application')
-        config.accept('text', key='event')
-        config.accept('integer', key='priority')
-        config.accept('text', key='description')
-        return config
-
-    def prepare_config(self, config):
-        if isinstance(config, bool):
-            config = {'enabled': config}
-        config.setdefault('apikey', '')
-        config.setdefault('application', 'FlexGet')
-        config.setdefault('event', 'New release')
-        config.setdefault('priority', 0)
-        return config
+    schema = {
+        'type': 'object',
+        'properties': {
+            'apikey': {'type': 'string'},
+            'application': {'type': 'string', 'default': 'FlexGet'},
+            'event': {'type': 'string', 'default': 'New Release'},
+            'priority': {'type': 'integer', 'default': 0},
+            'description': {'type': 'string'}
+        },
+        'required': ['apikey'],
+        'additionalProperties': False
+    }
 
     # Run last to make sure other outputs are successful before sending notification
     @plugin.priority(0)
     def on_task_output(self, task, config):
-        config = self.prepare_config(config)
         for entry in task.accepted:
 
             # get the parameters
@@ -77,7 +66,7 @@ class OutputProwl(object):
 
             url = 'https://api.prowlapp.com/publicapi/add'
             data = {'priority': priority, 'application': application, 'apikey': apikey,
-                    'event': event, 'description': description}
+                    'event': event.encode('utf-8'), 'description': description}
 
             if task.options.test:
                 log.info('Would send prowl message about: %s', entry['title'])
@@ -85,7 +74,7 @@ class OutputProwl(object):
                 continue
 
             try:
-                response = task.requests.post(url, headers=headers, data=data, raise_status=False)
+                response = task.requests.post(url, data=data, raise_status=False)
             except RequestException as e:
                 log.error('Error with request: %s' % e)
                 continue

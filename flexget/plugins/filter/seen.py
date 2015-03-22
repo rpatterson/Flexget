@@ -18,10 +18,10 @@ from sqlalchemy.schema import ForeignKey
 
 from flexget import db_schema, options, plugin
 from flexget.event import event
+from flexget.logger import console
 from flexget.manager import Session
 from flexget.utils.imdb import is_imdb_url, extract_id
 from flexget.utils.sqlalchemy_utils import table_schema, table_add_column
-from flexget.utils.tools import console
 
 log = logging.getLogger('seen')
 Base = db_schema.versioned_base('seen', 4)
@@ -138,22 +138,21 @@ class FilterSeen(object):
         This plugin is enabled on all tasks by default.
         See wiki for more information.
     """
+    schema = {
+        'oneOf': [
+            {'type': 'boolean'},
+            {'type': 'string', 'enum': ['global', 'local']}
+        ]
+    }
 
     def __init__(self):
         # remember and filter by these fields
         self.fields = ['title', 'url', 'original_url']
         self.keyword = 'seen'
 
-    def validator(self):
-        from flexget import validator
-        root = validator.factory()
-        root.accept('boolean')
-        root.accept('choice').accept_choices(['global', 'local'])
-        return root
-
     @plugin.priority(255)
     def on_task_filter(self, task, config, remember_rejected=False):
-        """Filter seen entries"""
+        """Filter entries already accepted on previous runs."""
         if config is False:
             log.debug('%s is disabled' % self.keyword)
             return
@@ -183,7 +182,7 @@ class FilterSeen(object):
                     se = task.session.query(SeenEntry).filter(SeenEntry.id == found.seen_entry_id).one()
                     entry.reject('Entry with %s `%s` is already marked seen in the task %s at %s' %
                                  (found.field, found.value, se.task, se.added.strftime('%Y-%m-%d %H:%M')),
-                                remember=remember_rejected)
+                                 remember=remember_rejected)
 
     def on_task_learn(self, task, config):
         """Remember succeeded entries"""
@@ -232,7 +231,7 @@ class FilterSeen(object):
 
 
 @event('manager.db_cleanup')
-def db_cleanup(session):
+def db_cleanup(manager, session):
     log.debug('TODO: Disabled because of ticket #1321')
     return
 
@@ -270,12 +269,11 @@ def seen_add(options):
         if imdb_id:
             seen_name = imdb_id
 
-    session = Session()
-    se = SeenEntry(seen_name, 'cli_seen')
-    sf = SeenField('cli_seen', seen_name)
-    se.fields.append(sf)
-    session.add(se)
-    session.commit()
+    with Session() as session:
+        se = SeenEntry(seen_name, 'cli_seen')
+        sf = SeenField('cli_seen', seen_name)
+        se.fields.append(sf)
+        session.add(se)
     console('Added %s as seen. This will affect all tasks.' % seen_name)
 
 

@@ -1,21 +1,23 @@
 """ Plugin Loading & Management.
 """
 
-from __future__ import unicode_literals, division, absolute_import
-import sys
+from __future__ import absolute_import, division, unicode_literals
+
+import logging
 import os
 import re
-import logging
+import sys
 import time
-import pkgutil
 import warnings
 from itertools import ifilter
 
+from path import path
 from requests import RequestException
 
-from flexget import config_schema
-from flexget.event import add_event_handler as add_phase_handler, fire_event, remove_event_handlers
 from flexget import plugins as plugins_pkg
+from flexget import config_schema
+from flexget.event import add_event_handler as add_phase_handler
+from flexget.event import fire_event, remove_event_handlers
 
 log = logging.getLogger('plugin')
 
@@ -354,14 +356,10 @@ def _get_standard_plugins_path():
     :returns: List of directories where plugins should be tried to load from.
     """
     # Get basic path from environment
+    paths = []
     env_path = os.environ.get('FLEXGET_PLUGIN_PATH')
     if env_path:
-        # Get rid of trailing slashes, since Python can't handle them when
-        # it tries to import modules.
-        paths = map(_strip_trailing_sep, env_path.split(os.pathsep))
-    else:
-        # Use standard default
-        paths = [os.path.join(os.path.expanduser('~'), '.flexget', 'plugins')]
+        paths = env_path.split(os.pathsep)
 
     # Add flexget.plugins directory (core plugins)
     paths.append(os.path.abspath(os.path.dirname(plugins_pkg.__file__)))
@@ -374,39 +372,39 @@ def _load_plugins_from_dirs(dirs):
     """
 
     log.debug('Trying to load plugins from: %s' % dirs)
-    # add all dirs to plugins_pkg load path so that plugins are loaded from flexget and from ~/.flexget/plugins/
+    dirs = [path(d) for d in dirs if os.path.isdir(d)]
+    # add all dirs to plugins_pkg load path so that imports work properly from any of the plugin dirs
     plugins_pkg.__path__ = map(_strip_trailing_sep, dirs)
-    for importer, name, ispkg in pkgutil.walk_packages(dirs, plugins_pkg.__name__ + '.'):
-        if ispkg:
-            continue
-        # Don't load any plugins again if they are already loaded
-        # This can happen if one plugin imports from another plugin
-        if name in sys.modules:
-            continue
-        loader = importer.find_module(name)
-        # Don't load from pyc files
-        if not loader.filename.endswith('.py'):
-            continue
-        try:
-            loaded_module = loader.load_module(name)
-        except DependencyError as e:
-            if e.has_message():
-                msg = e.message
+    for plugins_dir in dirs:
+        for plugin_path in plugins_dir.walkfiles('*.py'):
+            if plugin_path.name == '__init__.py':
+                continue
+            # Split the relative path from the plugins dir to current file's parent dir to find subpackage names
+            plugin_subpackages = filter(None, plugin_path.relpath(plugins_dir).parent.splitall())
+            module_name = '.'.join([plugins_pkg.__name__] + plugin_subpackages + [plugin_path.namebase])
+            try:
+                __import__(module_name)
+            except DependencyError as e:
+                if e.has_message():
+                    msg = e.message
+                else:
+                    msg = 'Plugin `%s` requires `%s` to load.' % (e.issued_by or module_name, e.missing or 'N/A')
+                if not e.silent:
+                    log.warning(msg)
+                else:
+                    log.debug(msg)
+            except ImportError as e:
+                log.critical('Plugin `%s` failed to import dependencies' % module_name)
+                log.exception(e)
+            except ValueError as e:
+                # Debugging #2755
+                log.error('ValueError attempting to import `%s` (from %s): %s', module_name, plugin_path, e)
+            except Exception as e:
+                log.critical('Exception while loading plugin %s' % module_name)
+                log.exception(e)
+                raise
             else:
-                msg = 'Plugin `%s` requires `%s` to load.' % (e.issued_by or name, e.missing or 'N/A')
-            if not e.silent:
-                log.warning(msg)
-            else:
-                log.debug(msg)
-        except ImportError as e:
-            log.critical('Plugin `%s` failed to import dependencies' % name)
-            log.exception(e)
-        except Exception as e:
-            log.critical('Exception while loading plugin %s' % name)
-            log.exception(e)
-            raise
-        else:
-            log.trace('Loaded module %s from %s' % (name, loaded_module.__file__))
+                log.trace('Loaded module %s from %s' % (module_name, plugin_path))
 
     if _new_phase_queue:
         for phase, args in _new_phase_queue.iteritems():
@@ -414,13 +412,22 @@ def _load_plugins_from_dirs(dirs):
                       'point (before, after). Plugin is not working properly.' % (args[0], phase))
 
 
-def load_plugins():
-    """Load plugins from the standard plugin paths."""
+def load_plugins(extra_dirs=None):
+    """
+    Load plugins from the standard plugin paths.
+    :param list extra_dirs: Extra directories from where plugins are loaded.
+    """
     global plugins_loaded
+
+    if not extra_dirs:
+        extra_dirs = []
+
+    # Add flexget.plugins directory (core plugins)
+    extra_dirs.extend(_get_standard_plugins_path())
 
     start_time = time.time()
     # Import all the plugins
-    _load_plugins_from_dirs(_get_standard_plugins_path())
+    _load_plugins_from_dirs(extra_dirs)
     # Register them
     fire_event('plugin.register')
     # Plugins should only be registered once, remove their handlers after
@@ -433,7 +440,7 @@ def load_plugins():
     log.debug('Plugins took %.2f seconds to load' % took)
 
 
-def get_plugins(phase=None, group=None, context=None, category=None, min_api=None):
+def get_plugins(phase=None, group=None, context=None, category=None, name=None, min_api=None):
     """
     Query other plugins characteristics.
 
@@ -441,6 +448,7 @@ def get_plugins(phase=None, group=None, context=None, category=None, min_api=Non
     :param string group: Plugin must belong to this group.
     :param string context: Where plugin is configured, eg. (root, task)
     :param string category: Type of plugin, phase names.
+    :param string name: Name of the plugin.
     :param int min_api: Minimum api version.
     :return: List of PluginInfo instances.
     :rtype: list
@@ -455,6 +463,8 @@ def get_plugins(phase=None, group=None, context=None, category=None, min_api=Non
         if context and not context in plugin.contexts:
             return False
         if category and not category == plugin.category:
+            return False
+        if name is not None and name != plugin.name:
             return False
         if min_api is not None and plugin.api_ver < min_api:
             return False

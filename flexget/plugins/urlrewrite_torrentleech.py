@@ -83,14 +83,14 @@ class UrlRewriteTorrentleech(object):
             log.debug("Got the URL: %s" % entry['url'])
         if entry['url'].startswith('http://torrentleech.org/torrents/browse/index/query/'):
             # use search
-            results = self.search(entry)
+            results = self.search(task, entry)
             if not results:
                 raise UrlRewritingError("No search results found")
             # TODO: Search doesn't enforce close match to title, be more picky
             entry['url'] = results[0]['url']
 
     @plugin.internet(log)
-    def search(self, entry, config=None):
+    def search(self, task, entry, config=None):
         """
         Search for name from torrentleech.
         """
@@ -115,7 +115,7 @@ class UrlRewriteTorrentleech(object):
         filter_url = '/categories/%s' % ','.join(str(c) for c in categories)
         entries = set()
         for search_string in entry.get('search_strings', [entry['title']]):
-            query = normalize_unicode(search_string)
+            query = normalize_unicode(search_string).replace(":", "")
             # urllib.quote will crash if the unicode string has non ascii characters, so encode in utf-8 beforehand
             url = ('http://torrentleech.org/torrents/browse/index/query/' +
                    urllib.quote(query.encode('utf-8')) + filter_url)

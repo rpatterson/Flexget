@@ -1,6 +1,7 @@
 """Contains miscellaneous helpers"""
 
 from __future__ import unicode_literals, division, absolute_import, print_function
+import copy
 import urllib2
 import httplib
 import os
@@ -9,6 +10,10 @@ import time
 import re
 import sys
 import locale
+import Queue
+import ast
+import operator
+
 from collections import MutableMapping
 from urlparse import urlparse
 from htmlentitydefs import name2codepoint
@@ -133,7 +138,6 @@ def _xmlcharref_encode(unicode_data, encoding):
 
 def merge_dict_from_to(d1, d2):
     """Merges dictionary d1 into dictionary d2. d1 will remain in original form."""
-    import copy
     for k, v in d1.items():
         if k in d2:
             if type(v) == type(d2[k]):
@@ -145,9 +149,9 @@ def merge_dict_from_to(d1, d2):
                     pass
                 else:
                     raise Exception('Unknown type: %s value: %s in dictionary' % (type(v), repr(v)))
-            elif isinstance(v, basestring) and isinstance(d2[k], basestring):
-                # Strings are compatible by definition
-                # (though we could get a decode error later, this is higly unlikely for config values)
+            elif (isinstance(v, (basestring, bool, int, float, type(None))) and
+                    isinstance(d2[k], (basestring, bool, int, float, type(None)))):
+                # Allow overriding of non-container types with other non-container types
                 pass
             else:
                 raise MergeException('Merging key %s failed, conflicting datatypes %r vs. %r.' % (
@@ -371,6 +375,38 @@ else:
         # process is still running.
         return is_running or exit_code.value == STILL_ACTIVE
 
+_binOps = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.div,
+    ast.Mod: operator.mod
+}
+
+
+def arithmeticEval(s):
+    """
+    A safe eval supporting basic arithmetic operations.
+
+    :param s: expression to evaluate
+    :return: value
+    """
+    node = ast.parse(s, mode='eval')
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        elif isinstance(node, ast.Str):
+            return node.s
+        elif isinstance(node, ast.Num):
+            return node.n
+        elif isinstance(node, ast.BinOp):
+            return _binOps[type(node.op)](_eval(node.left), _eval(node.right))
+        else:
+            raise Exception('Unsupported type {}'.format(node))
+
+    return _eval(node.body)
+
 
 class TimedDict(MutableMapping):
     """Acts like a normal dict, but keys will only remain in the dictionary for a specified time span."""
@@ -401,3 +437,22 @@ class TimedDict(MutableMapping):
 
     def __repr__(self):
         return '%s(%r)' % (self.__class__.__name__, dict(zip(self._store, (v[1] for v in self._store.values()))))
+
+
+class BufferQueue(Queue.Queue):
+    """Used in place of a file-like object to capture text and access it safely from another thread."""
+    # Allow access to the Empty error from here
+    Empty = Queue.Empty
+
+    def write(self, line):
+        self.put(line)
+
+
+def singleton(cls):
+    instances = {}
+
+    def getinstance(*args, **kwargs):
+        if cls not in instances:
+            instances[cls] = cls(*args, **kwargs)
+        return instances[cls]
+    return getinstance

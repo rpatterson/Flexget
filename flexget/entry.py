@@ -1,11 +1,10 @@
-from __future__ import unicode_literals, division, absolute_import
-from exceptions import Exception, UnicodeDecodeError, TypeError, KeyError
-import logging
+from __future__ import absolute_import, division, unicode_literals
+
 import copy
 import functools
+import logging
 
 from flexget.plugin import PluginError
-from flexget.utils.imdb import extract_id, make_url
 from flexget.utils.template import render_from_entry
 
 log = logging.getLogger('entry')
@@ -219,24 +218,14 @@ class Entry(dict):
 
         # url and original_url handling
         if key == 'url':
-            if not isinstance(value, basestring):
+            if not isinstance(value, (basestring, LazyField)):
                 raise PluginError('Tried to set %r url to %r' % (self.get('title'), value))
             self.setdefault('original_url', value)
 
         # title handling
         if key == 'title':
-            if not isinstance(value, basestring):
+            if not isinstance(value, (basestring, LazyField)):
                 raise PluginError('Tried to set title to %r' % value)
-
-        # TODO: HACK! Implement via plugin once #348 (entry events) is implemented
-        # enforces imdb_url in same format
-        if key == 'imdb_url' and isinstance(value, basestring):
-            imdb_id = extract_id(value)
-            if imdb_id:
-                value = make_url(imdb_id)
-            else:
-                log.debug('Tried to set imdb_id to invalid imdb url: %s' % value)
-                value = None
 
         try:
             log.trace('ENTRY SET: %s = %r' % (key, value))
@@ -309,7 +298,7 @@ class Entry(dict):
             if self.is_lazy(field):
                 # If the field is already a lazy field, append this function to it's list of functions
                 dict.get(self, field).funcs.append(func)
-            elif not self.get(field, eval_lazy=False):
+            elif self.get(field, eval_lazy=False) is None:
                 # If it is not a lazy field, and isn't already populated, make it a lazy field
                 self[field] = LazyField(self, field, func)
 

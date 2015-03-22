@@ -1,32 +1,39 @@
-from __future__ import unicode_literals, division, absolute_import, print_function
+from __future__ import absolute_import, division, print_function, unicode_literals
+
 import atexit
 import codecs
-from contextlib import contextmanager
-import signal
-import os
-import sys
-import shutil
+import copy
+import fnmatch
 import logging
+import os
+import shutil
+import signal
+import sys
 import threading
-import pkg_resources
-import yaml
+import traceback
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+import pkg_resources
 import sqlalchemy
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.pool import SingletonThreadPool
+import yaml
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
 # These need to be declared before we start importing from other flexget modules, since they might import them
+from flexget.utils.sqlalchemy_utils import ContextSession
 Base = declarative_base()
-Session = sessionmaker()
+Session = sessionmaker(class_=ContextSession)
 
-from flexget import config_schema, db_schema
+from flexget import config_schema, db_schema, logger, plugin
 from flexget.event import fire_event
-from flexget.ipc import IPCServer, IPCClient
-from flexget.scheduler import Scheduler
+from flexget.ipc import IPCClient, IPCServer
+from flexget.options import CoreArgumentParser, get_parser, manager_parser, ParserError, unicode_argv
+from flexget.task import Task
+from flexget.task_queue import TaskQueue
 from flexget.utils.tools import pid_exists
+
 
 log = logging.getLogger('manager')
 
@@ -34,10 +41,13 @@ manager = None
 DB_CLEANUP_INTERVAL = timedelta(days=7)
 
 
-@sqlalchemy.event.listens_for(Session, 'before_commit')
-def before_commit(session):
-    if not manager.has_lock and session.dirty:
-        log.debug('BUG?: Database writes should not be tried when there is no database lock.')
+@sqlalchemy.event.listens_for(sqlalchemy.engine.Engine, 'connect')
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    # There were reported db problems with WAL mode on XFS filesystem, which is sticky and may have been turned
+    # on with certain FlexGet versions (e2c118e) #2749
+    cursor.execute('PRAGMA journal_mode=delete')
+    cursor.close()
 
 
 class Manager(object):
@@ -77,6 +87,10 @@ class Manager(object):
       If any plugins have declared a newer schema version than exists in the database, this event will be fired to
       allow plugins to upgrade their tables
 
+    * manager.shutdown_requested
+
+      When shutdown has been requested. Any plugins which might add to execution queue should stop when this is fired.
+
     * manager.shutdown
 
       When the manager is exiting
@@ -93,13 +107,17 @@ class Manager(object):
     unit_test = False
     options = None
 
-    def __init__(self, options):
+    def __init__(self, args):
         """
-        :param options: argparse parsed options object
+        :param args: CLI args
         """
         global manager
         assert not manager, 'Only one instance of Manager should be created at a time!'
-        self.options = options
+
+        if args is None:
+            # Decode all arguments to unicode before parsing
+            args = unicode_argv()[1:]
+        self.args = args
         self.config_base = None
         self.config_name = None
         self.config_path = None
@@ -109,48 +127,87 @@ class Manager(object):
         self.database_uri = None
         self.db_upgraded = False
         self._has_lock = False
+        self.is_daemon = False
+        self.ipc_server = None
+        self.task_queue = None
+        self.persist = None
+        self.initialized = False
 
         self.config = {}
 
-        self.scheduler = Scheduler(self)
-        self.ipc_server = IPCServer(self, options.ipc_port)
-        manager = self
-        self.initialize()
+        if '--help' in args or '-h' in args:
+            # TODO: This is a bit hacky, but we can't call parse on real arguments when --help is used because it will
+            # cause a system exit before plugins are loaded and print incomplete help. This will get us a default
+            # options object and we'll parse the real args later, or send them to daemon. #2807
+            self.options, extra = CoreArgumentParser().parse_known_args(['execute'])
+        else:
+            try:
+                self.options, extra = CoreArgumentParser().parse_known_args(args)
+            except ParserError:
+                # If a non-built-in command was used, we need to parse with a parser that doesn't define the subparsers
+                self.options, extra = manager_parser.parse_known_args(args)
+        try:
+            self.find_config(create=False)
+        except:
+            logger.start(level=self.options.loglevel.upper(), to_file=False)
+            raise
+        else:
+            log_file = os.path.expanduser(self.options.logfile)
+            # If an absolute path is not specified, use the config directory.
+            if not os.path.isabs(log_file):
+                log_file = os.path.join(self.config_base, log_file)
+            logger.start(log_file, self.options.loglevel.upper(), to_console=not self.options.cron)
 
-        # cannot be imported at module level because of circular references
-        from flexget.utils.simple_persistence import SimplePersistence
-        self.persist = SimplePersistence('manager')
+        manager = self
 
         log.debug('sys.defaultencoding: %s' % sys.getdefaultencoding())
         log.debug('sys.getfilesystemencoding: %s' % sys.getfilesystemencoding())
         log.debug('os.path.supports_unicode_filenames: %s' % os.path.supports_unicode_filenames)
-
-        if db_schema.upgrade_required():
-            log.info('Database upgrade is required. Attempting now.')
-            # Make sure not to fire the lock-acquired event yet
-            # TODO: Detect if any database upgrading is needed and acquire the lock only in one place
-            with self.acquire_lock(event=False):
-                fire_event('manager.upgrade', self)
-                if manager.db_upgraded:
-                    fire_event('manager.db_upgraded', self)
-        fire_event('manager.startup', self)
+        if codecs.lookup(sys.getfilesystemencoding()).name == 'ascii' and not os.path.supports_unicode_filenames:
+            log.warning('Your locale declares ascii as the filesystem encoding. Any plugins reading filenames from '
+                        'disk will not work properly for filenames containing non-ascii characters. Make sure your '
+                        'locale env variables are set up correctly for the environment which is launching FlexGet.')
 
     def __del__(self):
         global manager
         manager = None
 
     def initialize(self):
-        """Separated from __init__ so that unit tests can modify options before loading config."""
+        """
+        Load plugins, database, and config. Also initializes (but does not start) the task queue and ipc server.
+        This should only be called after obtaining a lock.
+        """
+        if self.initialized:
+            raise RuntimeError('Cannot call initialize on an already initialized manager.')
+
+        plugin.load_plugins(extra_dirs=[os.path.join(self.config_base, 'plugins')])
+
+        # Reparse CLI options now that plugins are loaded
+        self.options = get_parser().parse_args(self.args)
+
+        self.task_queue = TaskQueue()
+        self.ipc_server = IPCServer(self, self.options.ipc_port)
+
         self.setup_yaml()
-        self.find_config(create=(self.options.cli_command == 'webui'))
         self.init_sqlalchemy()
         fire_event('manager.initialize', self)
         try:
             self.load_config()
         except ValueError as e:
             log.critical('Failed to load config file: %s' % e.args[0])
-            self.shutdown(finish_queue=False)
-            sys.exit(1)
+            raise
+
+        # cannot be imported at module level because of circular references
+        from flexget.utils.simple_persistence import SimplePersistence
+        self.persist = SimplePersistence('manager')
+
+        if db_schema.upgrade_required():
+            log.info('Database upgrade is required. Attempting now.')
+            fire_event('manager.upgrade', self)
+            if manager.db_upgraded:
+                fire_event('manager.db_upgraded', self)
+        fire_event('manager.startup', self)
+        self.initialized = True
 
     @property
     def tasks(self):
@@ -163,68 +220,160 @@ class Manager(object):
     def has_lock(self):
         return self._has_lock
 
-    def run_cli_command(self):
+    def execute(self, options=None, output=None, loglevel=None, priority=1):
         """
-        Starting point when executing from commandline, dispatch execution
-        to correct destination.
+        Run all (can be limited with options) tasks from the config.
+
+        :param options: Either an :class:`argparse.Namespace` instance, or a dict, containing options for execution
+        :param output: If a file-like object is specified here, log messages and stdout from the execution will be
+            written to it.
+        :param priority: If there are other executions waiting to be run, they will be run in priority order,
+            lowest first.
+        :returns: a list of :class:`threading.Event` instances which will be
+            set when each respective task has finished running
+        """
+        if options is None:
+            options = copy.copy(self.options.execute)
+        elif isinstance(options, dict):
+            options_namespace = copy.copy(self.options.execute)
+            options_namespace.__dict__.update(options)
+            options = options_namespace
+        task_names = self.tasks
+        # Handle --tasks
+        if options.tasks:
+            # Consider * the same as not specifying tasks at all (makes sure manual plugin still works)
+            if options.tasks == ['*']:
+                options.tasks = None
+            else:
+                # Create list of tasks to run, preserving order
+                task_names = []
+                for arg in options.tasks:
+                    matches = [t for t in self.tasks if fnmatch.fnmatchcase(unicode(t).lower(), arg.lower())]
+                    if not matches:
+                        msg = '`%s` does not match any tasks' % arg
+                        log.error(msg)
+                        if output:
+                            output.write(msg)
+                        continue
+                    task_names.extend(m for m in matches if m not in task_names)
+                # Set the option as a list of matching task names so plugins can use it easily
+                options.tasks = task_names
+        # TODO: 1.2 This is a hack to make task priorities work still, not sure if it's the best one
+        task_names = sorted(task_names, key=lambda t: self.config['tasks'][t].get('priority', 65535))
+
+        finished_events = []
+        for task_name in task_names:
+            task = Task(self, task_name, options=options, output=output, loglevel=loglevel, priority=priority)
+            self.task_queue.put(task)
+            finished_events.append(task.finished_event)
+        return finished_events
+
+    def start(self):
+        """
+        Starting point when executing from commandline, dispatch execution to correct destination.
+
+        If there is a FlexGet process with an ipc server already running, the command will be sent there for execution
+        and results will be streamed back.
+        If not, this will attempt to obtain a lock, initialize the manager, and run the command here.
+        """
+        # When we are in test mode, we use a different lock file and db
+        if self.options.test:
+            self.lockfile = os.path.join(self.config_base, '.test-%s-lock' % self.config_name)
+        # If another process is started, send the execution to the running process
+        ipc_info = self.check_ipc_info()
+        if ipc_info:
+            try:
+                log.info('There is a FlexGet process already running for this config, sending execution there.')
+                client = IPCClient(ipc_info['port'], ipc_info['password'])
+            except ValueError as e:
+                log.error(e)
+            else:
+                try:
+                    client.handle_cli(self.args)
+                except KeyboardInterrupt:
+                    log.error('Disconnecting from daemon due to ctrl-c. Executions will still continue in the '
+                              'background.')
+                except EOFError:
+                    log.error('Connection from daemon was severed.')
+            return
+        if self.options.test:
+            log.info('Test mode, creating a copy from database ...')
+            db_test_filename = os.path.join(self.config_base, 'test-%s.sqlite' % self.config_name)
+            if os.path.exists(self.db_filename):
+                shutil.copy(self.db_filename, db_test_filename)
+                log.info('Test database created')
+            self.db_filename = db_test_filename
+        # No running process, we start our own to handle command
+        with self.acquire_lock():
+            self.initialize()
+            self.handle_cli()
+            self._shutdown()
+
+    def handle_cli(self, options=None):
+        """
+        Dispatch a cli command to the appropriate function.
 
         * :meth:`.execute_command`
         * :meth:`.daemon_command`
         * :meth:`.webui_command`
         * CLI plugin callback function
+
+        The manager should have a lock and be initialized before calling this method.
+
+        :param options: argparse options for command. Defaults to options that manager was instantiated with.
         """
-        command = self.options.cli_command
-        options = getattr(self.options, command)
+        if not options:
+            options = self.options
+        command = options.cli_command
+        command_options = getattr(options, command)
         # First check for built-in commands
-        if command == 'execute':
-            self.execute_command(options)
-        elif command == 'daemon':
-            self.daemon_command(options)
-        elif command == 'webui':
-            self.webui_command(options)
+        if command in ['execute', 'daemon', 'webui']:
+            if command == 'execute':
+                self.execute_command(command_options)
+            elif command == 'daemon':
+                self.daemon_command(command_options)
+            elif command == 'webui':
+                self.webui_command(command_options)
         else:
             # Otherwise dispatch the command to the callback function
-            options.cli_command_callback(self, options)
+            options.cli_command_callback(self, command_options)
 
     def execute_command(self, options):
         """
-        Send execute command to daemon through IPC or perform execution
-        on current process.
+        Handles the 'execute' CLI command.
+
+        If there is already a task queue running in this process, adds the execution to the queue.
+        If FlexGet is being invoked with this command, starts up a task queue and runs the execution.
 
         Fires events:
 
+        * manager.execute.started
         * manager.execute.completed
 
         :param options: argparse options
         """
-        # If a daemon is started, send the execution to the daemon
-        ipc_info = self.check_ipc_info()
-        if ipc_info:
-            try:
-                log.info('There is a daemon running for this config. Sending execution to running daemon.')
-                client = IPCClient(ipc_info['port'], ipc_info['password'])
-            except ValueError as e:
-                log.error(e)
-            else:
-                client.execute(dict(options))
-            self.shutdown()
-            return
-        # Otherwise we run the execution ourselves
-        with self.acquire_lock():
-            fire_event('manager.execute.started', self)
-            self.scheduler.start(run_schedules=False)
-            self.scheduler.execute(options)
-            self.scheduler.shutdown(finish_queue=True)
-            try:
-                self.scheduler.wait()
-            except KeyboardInterrupt:
-                log.error('Got ctrl-c exiting after this task completes. Press ctrl-c again to abort this task.')
-            else:
-                fire_event('manager.execute.completed', self)
-            self.shutdown(finish_queue=False)
+        fire_event('manager.execute.started', self, options)
+        if self.task_queue.is_alive():
+            if len(self.task_queue):
+                log.verbose('There is a task already running, execution queued.')
+            finished_events = self.execute(options, output=logger.get_capture_stream(),
+                                           loglevel=logger.get_capture_loglevel())
+            if not options.cron:
+                # Wait until execution of all tasks has finished
+                for event in finished_events:
+                    event.wait()
+        else:
+            self.task_queue.start()
+            self.ipc_server.start()
+            self.execute(options)
+            self.shutdown(finish_queue=True)
+            self.task_queue.wait()
+        fire_event('manager.execute.completed', self, options)
 
     def daemon_command(self, options):
         """
+        Handles the 'daemon' CLI command.
+
         Fires events:
 
         * manager.daemon.started
@@ -233,50 +382,52 @@ class Manager(object):
         :param options: argparse options
         """
         if options.action == 'start':
+            if self.is_daemon:
+                log.error('Daemon already running for this config.')
+                return
             if options.daemonize:
                 self.daemonize()
-            with self.acquire_lock():
-                try:
-                    signal.signal(signal.SIGTERM, self._handle_sigterm)
-                except ValueError as e:
-                    # If flexget is being called from another script, e.g. windows service helper, and we are not the
-                    # main thread, this error will occur.
-                    log.debug('Error registering sigterm handler: %s' % e)
-                self.ipc_server.start()
-                fire_event('manager.daemon.started', self)
-                self.scheduler.start()
-                try:
-                    self.scheduler.wait()
-                except KeyboardInterrupt:
-                    log.info('Got ctrl-c, shutting down.')
-                    fire_event('manager.daemon.completed', self)
-                    self.shutdown(finish_queue=False)
-        elif options.action == 'status':
-            ipc_info = self.check_ipc_info()
-            if ipc_info:
-                log.info('Daemon running. (PID: %s)' % ipc_info['pid'])
-            else:
-                log.info('No daemon appears to be running for this config.')
-        elif options.action in ['stop', 'reload']:
-            ipc_info = self.check_ipc_info()
-            if ipc_info:
-                try:
-                    client = IPCClient(ipc_info['port'], ipc_info['password'])
-                except ValueError as e:
-                    log.error(e)
-                else:
-                    if options.action == 'stop':
-                        client.shutdown()
-                    elif options.action == 'reload':
-                        client.reload()
-                self.shutdown()
-            else:
+            try:
+                signal.signal(signal.SIGTERM, self._handle_sigterm)
+            except ValueError as e:
+                # If flexget is being called from another script, e.g. windows service helper, and we are not the
+                # main thread, this error will occur.
+                log.debug('Error registering sigterm handler: %s' % e)
+            self.is_daemon = True
+            fire_event('manager.daemon.started', self)
+            self.task_queue.start()
+            self.ipc_server.start()
+            self.task_queue.wait()
+            fire_event('manager.daemon.completed', self)
+        elif options.action in ['stop', 'reload', 'status']:
+            if not self.is_daemon:
                 log.error('There does not appear to be a daemon running.')
+                return
+            if options.action == 'status':
+                log.info('Daemon running. (PID: %s)' % os.getpid())
+            elif options.action == 'stop':
+                tasks = 'all queued tasks (if any) have' if options.wait else 'currently running task (if any) has'
+                log.info('Daemon shutdown requested. Shutdown will commence when %s finished executing.' % tasks)
+                self.shutdown(options.wait)
+            elif options.action == 'reload':
+                log.info('Reloading config from disk.')
+                try:
+                    self.load_config()
+                except ValueError as e:
+                    log.error('Error loading config: %s' % e.args[0])
+                else:
+                    log.info('Config successfully reloaded from disk.')
 
     def webui_command(self, options):
         """
+        Handles the 'webui' CLI command.
+
         :param options: argparse options
         """
+        if self.is_daemon:
+            log.error('Webui or daemon is already running.')
+            return
+        # TODO: make webui an enablable plugin in regular daemon mode
         try:
             pkg_resources.require('flexget[webui]')
         except pkg_resources.DistributionNotFound as e:
@@ -286,9 +437,12 @@ class Manager(object):
             return
         if options.daemonize:
             self.daemonize()
+        self.is_daemon = True
         from flexget.ui import webui
-        with self.acquire_lock():
-            webui.start(self)
+        self.task_queue.start()
+        self.ipc_server.start()
+        webui.start(self)
+        self.task_queue.wait()
 
     def _handle_sigterm(self, signum, frame):
         log.info('Got SIGTERM. Shutting down.')
@@ -325,6 +479,7 @@ class Manager(object):
         Find the configuration file.
 
         :param bool create: If a config file is not found, and create is True, one will be created in the home folder
+        :raises: `IOError` when no config file could be found, and `create` is False.
         """
         config = None
         home_path = os.path.join(os.path.expanduser('~'), '.flexget')
@@ -364,22 +519,26 @@ class Manager(object):
             else:
                 config = None
 
-        if not (config and os.path.exists(config)):
-            if not create:
-                log.info('Tried to read from: %s' % ', '.join(possible))
-                log.critical('Failed to find configuration file %s' % options_config)
-                sys.exit(1)
+        if create and not (config and os.path.exists(config)):
             config = os.path.join(home_path, options_config)
             log.info('Config file %s not found. Creating new config %s' % (options_config, config))
             with open(config, 'w') as newconfig:
                 # Write empty tasks to the config
                 newconfig.write(yaml.dump({'tasks': {}}))
+        elif not config:
+            log.critical('Failed to find configuration file %s' % options_config)
+            log.info('Tried to read from: %s' % ', '.join(possible))
+            raise IOError('No configuration file found.')
+        if not os.path.isfile(config):
+            raise IOError('Config `%s` does not appear to be a file.' % config)
 
         log.debug('Config file %s selected' % config)
         self.config_path = config
         self.config_name = os.path.splitext(os.path.basename(config))[0]
         self.config_base = os.path.normpath(os.path.dirname(config))
         self.lockfile = os.path.join(self.config_base, '.%s-lock' % self.config_name)
+        self.db_filename = os.path.join(self.config_base, 'db-%s.sqlite' % self.config_name)
+
 
     def load_config(self):
         """
@@ -399,7 +558,7 @@ class Manager(object):
         except Exception as e:
             msg = str(e).replace('\n', ' ')
             msg = ' '.join(msg.split())
-            log.critical(msg)
+            log.critical(msg, exc_info=False)
             print('')
             print('-' * 79)
             print(' Malformed configuration file (check messages above). Common reasons:')
@@ -451,14 +610,14 @@ class Manager(object):
         :raises: `ValueError` and rolls back to previous config if the provided config is not valid.
         """
         old_config = self.config
-        self.config = config
-        errors = self.validate_config()
-        if errors:
-            for error in errors:
-                log.critical("[%s] %s", error.json_pointer, error.message)
+        try:
+            self.config = self.validate_config(config)
+        except ValueError as e:
+            for error in getattr(e, 'errors', []):
+                log.critical('[%s] %s', error.json_pointer, error.message)
             log.debug('invalid config, rolling back')
             self.config = old_config
-            raise ValueError('Config did not pass schema validation')
+            raise
         log.debug('New config data loaded.')
         fire_event('manager.config_updated', self)
 
@@ -479,14 +638,25 @@ class Manager(object):
         for task in self.tasks:
             config_changed(task)
 
-    def validate_config(self):
+    def validate_config(self, config=None):
         """
-        Check all root level keywords are valid.
+        Check all root level keywords are valid. Config may be modified by before_config_validate hooks. Modified
+        config will be returned.
 
-        :returns: A list of `ValidationError`s
+        :param config: Config to check. If not provided, current manager config will be checked.
+        :raises: `ValueError` when config fails validation. There will be an `errors` attribute with the schema errors.
+        :returns: Final validated config.
         """
-        fire_event('manager.before_config_validate', self)
-        return config_schema.process_config(self.config)
+        if not config:
+            config = self.config
+        config = fire_event('manager.before_config_validate', config, self)
+        errors = config_schema.process_config(config)
+        if errors:
+            err = ValueError('Did not pass schema validation.')
+            err.errors = errors
+            raise err
+        else:
+            return config
 
     def init_sqlalchemy(self):
         """Initialize SQLAlchemy"""
@@ -499,17 +669,6 @@ class Manager(object):
 
         # SQLAlchemy
         if self.database_uri is None:
-            self.db_filename = os.path.join(self.config_base, 'db-%s.sqlite' % self.config_name)
-            if self.options.test:
-                db_test_filename = os.path.join(self.config_base, 'test-%s.sqlite' % self.config_name)
-                log.info('Test mode, creating a copy from database ...')
-                if os.path.exists(self.db_filename):
-                    shutil.copy(self.db_filename, db_test_filename)
-                self.db_filename = db_test_filename
-                # Different database, different lock file
-                self.lockfile = os.path.join(self.config_base, '.test-%s-lock' % self.config_name)
-                log.info('Test database created')
-
             # in case running on windows, needs double \\
             filename = self.db_filename.replace('\\', '\\\\')
             self.database_uri = 'sqlite:///%s' % filename
@@ -522,8 +681,7 @@ class Manager(object):
         try:
             self.engine = sqlalchemy.create_engine(self.database_uri,
                                                    echo=self.options.debug_sql,
-                                                   poolclass=SingletonThreadPool,
-                                                   connect_args={'check_same_thread': False})  # assert_unicode=True
+                                                   connect_args={'check_same_thread': False, 'timeout': 10})
         except ImportError:
             print('FATAL: Unable to use SQLite. Are you running Python 2.5 - 2.7 ?\n'
                   'Python should normally have SQLite support built in.\n'
@@ -534,13 +692,6 @@ class Manager(object):
         Session.configure(bind=self.engine)
         # create all tables, doesn't do anything to existing tables
         try:
-            def before_table_create(event, target, bind, tables=None, **kw):
-                if tables:
-                    # We need to acquire a lock if we are creating new tables
-                    # TODO: Detect if any database upgrading is needed and acquire the lock only in one place
-                    self.acquire_lock(event=False).__enter__()
-
-            Base.metadata.append_ddl_listener('before-create', before_table_create)
             Base.metadata.create_all(bind=self.engine)
         except OperationalError as e:
             if os.path.exists(self.db_filename):
@@ -687,6 +838,9 @@ class Manager(object):
         os.dup2(si.fileno(), sys.stdin.fileno())
         os.dup2(so.fileno(), sys.stdout.fileno())
         os.dup2(se.fileno(), sys.stderr.fileno())
+        # If we have a lock, update the lock file with our new pid
+        if self._has_lock:
+            self.write_lock()
 
     def db_cleanup(self, force=False):
         """
@@ -705,7 +859,7 @@ class Manager(object):
             log.info('Running database cleanup.')
             session = Session()
             try:
-                fire_event('manager.db_cleanup', session)
+                fire_event('manager.db_cleanup', self, session)
                 session.commit()
             finally:
                 session.close()
@@ -717,20 +871,19 @@ class Manager(object):
 
     def shutdown(self, finish_queue=True):
         """
-        Application is being exited
+        Request manager shutdown.
 
         :param bool finish_queue: Should scheduler finish the task queue
         """
-        # Wait for scheduler to finish
-        self.scheduler.shutdown(finish_queue=finish_queue)
-        try:
-            self.scheduler.wait()
-        except KeyboardInterrupt:
-            log.debug('Not waiting for scheduler shutdown due to ctrl-c')
-            # show real stack trace in debug mode
-            if manager.options.debug:
-                raise
-            print('**** Keyboard Interrupt ****')
+        if not self.initialized:
+            raise RuntimeError('Cannot shutdown manager that was never initialized.')
+        fire_event('manager.shutdown_requested', self)
+        self.task_queue.shutdown(finish_queue)
+
+    def _shutdown(self):
+        """Runs when the manager is done processing everything."""
+        if self.ipc_server:
+            self.ipc_server.shutdown()
         fire_event('manager.shutdown', self)
         if not self.unit_test:  # don't scroll "nosetests" summary results when logging is enabled
             log.debug('Shutting down')
@@ -742,5 +895,16 @@ class Manager(object):
             if self._has_lock:
                 os.remove(self.db_filename)
                 log.info('Removed test database')
-        if not self.unit_test:  # don't scroll "nosetests" summary results when logging is enabled
-            log.debug('Shutdown completed')
+
+    def crash_report(self):
+        """
+        This should be called when handling an unexpected exception. Will create a new log file containing the last 50
+        debug messages as well as the crash traceback.
+        """
+        if not self.unit_test:
+            filename = os.path.join(self.config_base, datetime.now().strftime('crash_report.%Y.%m.%d.%H%M%S%f.log'))
+            with codecs.open(filename, 'w', encoding='utf-8') as outfile:
+                outfile.writelines(logger.debug_buffer)
+                traceback.print_exc(file=outfile)
+            log.critical('An unexpected crash has occurred. Writing crash report to %s' % filename)
+        log.debug('Traceback:', exc_info=True)

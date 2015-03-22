@@ -12,9 +12,10 @@ from sqlalchemy import Column, Integer, DateTime, Unicode, Index
 from flexget import db_schema, options, plugin
 from flexget.event import event
 from flexget.entry import Entry
+from flexget.logger import console
 from flexget.options import ParseExtrasAction, get_parser
 from flexget.utils.sqlalchemy_utils import table_schema, get_index_by_name
-from flexget.utils.tools import console, strip_html
+from flexget.utils.tools import strip_html
 from flexget.manager import Session
 
 log = logging.getLogger('archive')
@@ -230,7 +231,7 @@ class UrlrewriteArchive(object):
         {'type': 'array', 'items': {'type': 'string'}}
     ]}
 
-    def search(self, entry, config=None):
+    def search(self, task, entry, config=None):
         """Search plugin API method"""
 
         session = Session()
@@ -453,11 +454,11 @@ def cli_inject(manager, options):
             entry.accept('injected')
             entries.append(entry)
 
-        manager.scheduler.execute(options={'inject': entries, 'tasks': [task_name]})
+        manager.execute(options={'inject': entries, 'tasks': [task_name]})
 
     with manager.acquire_lock():
-        manager.scheduler.start(run_schedules=False)
-        manager.shutdown()
+        manager.shutdown(finish_queue=True)
+        manager.run()
 
 
 def do_cli(manager, options):

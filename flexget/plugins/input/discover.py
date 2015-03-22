@@ -6,9 +6,10 @@ import random
 from sqlalchemy import Column, Integer, DateTime, Unicode, Index
 
 from flexget import options, plugin
-from flexget.event import event
-from flexget.plugin import get_plugin_by_name, PluginError, PluginWarning
 from flexget import db_schema
+from flexget.event import event
+from flexget.manager import Session
+from flexget.plugin import get_plugin_by_name, PluginError, PluginWarning
 from flexget.utils.tools import parse_timedelta, multiply_timedelta
 
 log = logging.getLogger('discover')
@@ -35,7 +36,7 @@ Index('ix_discover_entry_title_task', DiscoverEntry.title, DiscoverEntry.task)
 
 
 @event('manager.db_cleanup')
-def db_cleanup(session):
+def db_cleanup(manager, session):
     value = datetime.datetime.now() - parse_timedelta('7 days')
     for de in session.query(DiscoverEntry).filter(DiscoverEntry.last_execution <= value).all():
         log.debug('deleting %s' % de)
@@ -114,10 +115,11 @@ class Discover(object):
                     entry_urls.update(urls)
         return entries
 
-    def execute_searches(self, config, entries):
+    def execute_searches(self, config, entries, task):
         """
         :param config: Discover plugin config
         :param entries: List of pseudo entries to search
+        :param task: Task being run
         :return: List of entries found from search engines listed under `from` configuration
         """
 
@@ -134,7 +136,12 @@ class Discover(object):
                 log.verbose('Searching for `%s` with plugin `%s` (%i of %i)' %
                             (entry['title'], plugin_name, index + 1, len(entries)))
                 try:
-                    search_results = search.search(entry, plugin_config)
+                    try:
+                        search_results = search.search(task=task, entry=entry, config=plugin_config)
+                    except TypeError:
+                        # Old search api did not take task argument
+                        log.warning('Search plugin %s does not support latest search api.' % plugin_name)
+                        search_results = search.search(entry, plugin_config)
                     if not search_results:
                         log.debug('No results from %s' % plugin_name)
                         entry.complete()
@@ -150,8 +157,11 @@ class Discover(object):
 
                     result.extend(search_results)
 
-                except (PluginError, PluginWarning) as err:
-                    log.debug('No results from %s: %s' % (plugin_name, err))
+                except PluginWarning as e:
+                    log.verbose('No results from %s: %s' % (plugin_name, e))
+                    entry.complete()
+                except PluginError as e:
+                    log.error('Error searching with %s: %s' % (plugin_name, e))
                     entry.complete()
 
         return sorted(result, reverse=True, key=lambda x: x.get('search_sort'))
@@ -209,32 +219,33 @@ class Discover(object):
             log.info('Ignoring interval because of --discover-now')
         result = []
         interval_count = 0
-        for entry in entries:
-            de = task.session.query(DiscoverEntry).\
-                filter(DiscoverEntry.title == entry['title']).\
-                filter(DiscoverEntry.task == task.name).first()
+        with Session() as session:
+            for entry in entries:
+                de = session.query(DiscoverEntry).\
+                    filter(DiscoverEntry.title == entry['title']).\
+                    filter(DiscoverEntry.task == task.name).first()
 
-            if not de:
-                log.debug('%s -> No previous run recorded' % entry['title'])
-                de = DiscoverEntry(entry['title'], task.name)
-                task.session.add(de)
-            if task.options.discover_now or not de.last_execution:
-                # First time we execute (and on --discover-now) we randomize time to avoid clumping
-                delta = multiply_timedelta(interval, random.random())
-                de.last_execution = datetime.datetime.now() - delta
-            else:
-                next_time = de.last_execution + interval
-                log.debug('last_time: %r, interval: %s, next_time: %r, ',
-                          de.last_execution, config['interval'], next_time)
-                if datetime.datetime.now() < next_time:
-                    log.debug('interval not met')
-                    interval_count += 1
-                    entry.reject('discover interval not met')
-                    entry.complete()
-                    continue
-                de.last_execution = datetime.datetime.now()
-            log.debug('interval passed')
-            result.append(entry)
+                if not de:
+                    log.debug('%s -> No previous run recorded' % entry['title'])
+                    de = DiscoverEntry(entry['title'], task.name)
+                    session.add(de)
+                if (not task.is_rerun and task.options.discover_now) or not de.last_execution:
+                    # First time we execute (and on --discover-now) we randomize time to avoid clumping
+                    delta = multiply_timedelta(interval, random.random())
+                    de.last_execution = datetime.datetime.now() - delta
+                else:
+                    next_time = de.last_execution + interval
+                    log.debug('last_time: %r, interval: %s, next_time: %r, ',
+                              de.last_execution, config['interval'], next_time)
+                    if datetime.datetime.now() < next_time:
+                        log.debug('interval not met')
+                        interval_count += 1
+                        entry.reject('discover interval not met')
+                        entry.complete()
+                        continue
+                    de.last_execution = datetime.datetime.now()
+                log.debug('interval passed')
+                result.append(entry)
         if interval_count:
             log.verbose('Discover interval of %s not met for %s entries. Use --discover-now to override.' %
                         (config['interval'], interval_count))
@@ -251,7 +262,7 @@ class Discover(object):
         entries = self.interval_expired(config, task, entries)
         if not config.get('ignore_estimations', False):
             entries = self.estimated(entries)
-        return self.execute_searches(config, entries)
+        return self.execute_searches(config, entries, task)
 
 
 @event('plugin.register')

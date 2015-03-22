@@ -119,7 +119,7 @@ _resolutions = [
     QualityComponent('resolution', 40, '576p', '576p?'),
     QualityComponent('resolution', 45, 'hr'),
     QualityComponent('resolution', 50, '720i'),
-    QualityComponent('resolution', 60, '720p', '(1280x)?720p?x?'),
+    QualityComponent('resolution', 60, '720p', '(1280x)?720(p|hd)?x?(50)?'),
     QualityComponent('resolution', 70, '1080i'),
     QualityComponent('resolution', 80, '1080p', '(1920x)?1080p?')
 ]
@@ -139,7 +139,7 @@ _sources = [
     QualityComponent('source', 130, 'dvdscr', '(?:(?:dvd|web)[\W_]?)?scr(?:eener)?', modifier=0),
     QualityComponent('source', 140, 'bdscr', 'bdscr(?:eener)?'),
     QualityComponent('source', 150, 'hdtv', 'a?hdtv(?:[\W_]?rip)?'),
-    QualityComponent('source', 160, 'webdl', 'web(?:[\W_]?(dl|hd))?'),
+    QualityComponent('source', 160, 'webdl', 'web(?:[\W_]?(dl|hd))'),
     QualityComponent('source', 170, 'dvdrip', 'dvd(?:[\W_]?rip)?'),
     QualityComponent('source', 175, 'remux'),
     QualityComponent('source', 180, 'bluray', '(?:b[dr][\W_]?rip|blu[\W_]?ray(?:[\W_]?rip)?)')
@@ -148,14 +148,15 @@ _codecs = [
     QualityComponent('codec', 10, 'divx'),
     QualityComponent('codec', 20, 'xvid'),
     QualityComponent('codec', 30, 'h264', '[hx].?264'),
-    QualityComponent('codec', 40, '10bit', '10.?bit|hi10p')
+    QualityComponent('codec', 40, 'h265', '[hx].?265|hevc'),
+    QualityComponent('codec', 50, '10bit', '10.?bit|hi10p')
 ]
 channels = '(?:(?:[\W_]?5[\W_]?1)|(?:[\W_]?2[\W_]?(?:0|ch)))'
 _audios = [
     QualityComponent('audio', 10, 'mp3'),
     # TODO: No idea what order these should go in or if we need different regexps
-    QualityComponent('audio', 20, 'dd5.1', 'dd%s' % channels),
-    QualityComponent('audio', 30, 'aac', 'aac%s?' % channels),
+    QualityComponent('audio', 20, 'aac', 'aac%s?' % channels),
+    QualityComponent('audio', 30, 'dd5.1', 'dd%s' % channels),
     QualityComponent('audio', 40, 'ac3', 'ac3%s?' % channels),
     QualityComponent('audio', 50, 'flac', 'flac%s?' % channels),
     # The DTSs are a bit backwards, but the more specific one needs to be parsed first
@@ -214,7 +215,7 @@ class Quality(object):
         """
         self.text = text
         self.clean_text = text
-        self.resolution = self._find_best(_resolutions, _UNKNOWNS['resolution'])
+        self.resolution = self._find_best(_resolutions, _UNKNOWNS['resolution'], False)
         self.source = self._find_best(_sources, _UNKNOWNS['source'])
         self.codec = self._find_best(_codecs, _UNKNOWNS['codec'])
         self.audio = self._find_best(_audios, _UNKNOWNS['audio'])
@@ -225,14 +226,19 @@ class Quality(object):
                 if not getattr(self, default.type):
                     setattr(self, default.type, default)
 
-    def _find_best(self, qlist, default=None):
+    def _find_best(self, qlist, default=None, strip_all=True):
         """Finds the highest matching quality component from `qlist`"""
         result = None
+        search_in = self.clean_text
         for item in qlist:
-            match = item.matches(self.clean_text)
+            match = item.matches(search_in)
             if match[0]:
                 result = item
                 self.clean_text = match[1]
+                if strip_all:
+                    # In some cases we want to strip all found quality components,
+                    # even though we're going to return only the last of them.
+                    search_in = self.clean_text
                 if item.modifier is not None:
                     # If this item has a modifier, do not proceed to check higher qualities in the list
                     break

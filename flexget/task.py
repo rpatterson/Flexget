@@ -1,20 +1,24 @@
-from __future__ import unicode_literals, division, absolute_import
+from __future__ import absolute_import, division, unicode_literals
+
 import copy
-from functools import wraps
 import hashlib
 import itertools
 import logging
+import threading
+from functools import wraps
 
-from sqlalchemy import Column, Unicode, String, Integer
+from sqlalchemy import Column, Integer, String, Unicode
 
-from flexget import config_schema
-from flexget import db_schema
+from flexget import config_schema, db_schema
 from flexget.entry import EntryUnicodeError
-from flexget.event import fire_event, event
+from flexget.event import event, fire_event
+from flexget.logger import capture_output
 from flexget.manager import Session
-from flexget.plugin import (get_plugins, task_phases, phase_methods, PluginWarning, PluginError,
-                            DependencyError, plugins as all_plugins, plugin_schemas)
+from flexget.plugin import plugins as all_plugins
+from flexget.plugin import (
+    DependencyError, get_plugins, phase_methods, plugin_schemas, PluginError, PluginWarning, task_phases)
 from flexget.utils import requests
+from flexget.utils.database import with_session
 from flexget.utils.simple_persistence import SimpleTaskPersistence
 
 log = logging.getLogger('task')
@@ -34,31 +38,33 @@ class TaskConfigHash(Base):
         return '<TaskConfigHash(task=%s,hash=%s)>' % (self.task, self.hash)
 
 
-def config_changed(task):
-    """Forces config_modified flag to come out true on next run. Used when the db changes, and all
-    entries need to be reprocessed."""
-    log.debug('Marking config as changed.')
-    session = Session()
-    try:
-        task_hash = session.query(TaskConfigHash).filter(TaskConfigHash.task == task).first()
-        if task_hash:
-            task_hash.hash = ''
-        session.commit()
-    finally:
-        session.close()
+@with_session
+def config_changed(task=None, session=None):
+    """
+    Forces config_modified flag to come out true on next run of `task`. Used when the db changes, and all
+    entries need to be reprocessed.
+
+    :param task: Name of the task. If `None`, will be set for all tasks.
+    """
+    log.debug('Marking config for %s as changed.' % (task or 'all tasks'))
+    task_hash = session.query(TaskConfigHash)
+    if task:
+        task_hash = task_hash.filter(TaskConfigHash.task == task)
+    task_hash.delete()
 
 
-def useTaskLogging(func):
+def use_task_logging(func):
 
     @wraps(func)
     def wrapper(self, *args, **kw):
-        # Set the task name in the logger
+        # Set the task name in the logger and capture output
         from flexget import logger
-        logger.set_task(self.name)
-        try:
-            return func(self, *args, **kw)
-        finally:
-            logger.set_task('')
+        with logger.task_logging(self.name):
+            if self.output:
+                with capture_output(self.output, loglevel=self.loglevel):
+                    return func(self, *args, **kw)
+            else:
+                return func(self, *args, **kw)
 
     return wrapper
 
@@ -158,6 +164,10 @@ class Task(object):
 
       ``parameters: task, keyword``
 
+    * task.execute.started
+
+      Before a task starts execution
+
     * task.execute.completed
 
       After task execution has been completed
@@ -167,16 +177,23 @@ class Task(object):
     """
 
     max_reruns = 5
+    # Used to determine task order, when priority is the same
+    _counter = itertools.count()
 
-    def __init__(self, manager, name, config=None, options=None):
+    def __init__(self, manager, name, config=None, options=None, output=None, loglevel=None, priority=None):
         """
         :param Manager manager: Manager instance.
         :param string name: Name of the task.
         :param dict config: Task configuration.
+        :param options: dict or argparse namespace with options for this task
+        :param output: A filelike that all logs and stdout will be sent to for this task.
+        :param loglevel: Custom loglevel, only log messages at this level will be sent to `output`
+        :param priority: If multiple tasks are waiting to run, the task with the lowest priority will be run first.
+            The default is 0, if the cron option is set though, the default is lowered to 10.
+
         """
         self.name = unicode(name)
         self.manager = manager
-        # raw_config should remain the untouched input config
         if config is None:
             config = manager.config['tasks'].get(name, {})
         self.config = copy.deepcopy(config)
@@ -188,6 +205,15 @@ class Task(object):
             options_namespace.__dict__.update(options)
             options = options_namespace
         self.options = options
+        self.output = output
+        self.loglevel = loglevel
+        if priority is None:
+            self.priority = 10 if self.options.cron else 0
+        else:
+            self.priority = priority
+        self.priority = priority
+        self._count = next(self._counter)
+        self.finished_event = threading.Event()
 
         # simple persistence
         self.simple_persistence = SimpleTaskPersistence(self)
@@ -197,8 +223,26 @@ class Task(object):
 
         self.config_modified = None
 
-        # use reset to init variables when creating
-        self._reset()
+        self.enabled = not self.name.startswith('_')
+
+        # These are just to query what happened in task. Call task.abort to set.
+        self.aborted = False
+        self.abort_reason = None
+        self.silent_abort = False
+
+        self.session = None
+
+        self.requests = requests.Session()
+
+        # List of all entries in the task
+        self._all_entries = EntryContainer()
+        self._rerun = False
+
+        self.disabled_phases = []
+
+        # current state
+        self.current_phase = None
+        self.current_plugin = None
 
     @property
     def undecided(self):
@@ -246,34 +290,8 @@ class Task(object):
     def is_rerun(self):
         return self._rerun_count
 
-    # TODO: can we get rid of this now that Tasks are instantiated on demand?
-    def _reset(self):
-        """Reset task state"""
-        log.debug('resetting %s' % self.name)
-        self.enabled = not self.name.startswith('_')
-        self.session = None
-        self.priority = 65535
-
-        self.requests = requests.Session()
-
-        # List of all entries in the task
-        self._all_entries = EntryContainer()
-
-        self.disabled_phases = []
-
-        # These are just to query what happened in task. Call task.abort to set.
-        self.aborted = False
-        self.abort_reason = None
-        self.silent_abort = False
-
-        self._rerun = False
-
-        # current state
-        self.current_phase = None
-        self.current_plugin = None
-
     def __cmp__(self, other):
-        return cmp(self.priority, other.priority)
+        return cmp((self.priority, self._count), (other.priority, other._count))
 
     def __str__(self):
         return '<Task(name=%s,aborted=%s)>' % (self.name, self.aborted)
@@ -357,7 +375,11 @@ class Task(object):
                     if not p.builtin:
                         break
                 else:
-                    log.warning('Task doesn\'t have any %s plugins, you should add (at least) one!' % phase)
+                    if phase == 'filter':
+                        log.warning('Task does not have any filter plugins to accept entries. '
+                                    'You need at least one to accept the entries you  want.')
+                    else:
+                        log.warning('Task doesn\'t have any %s plugins, you should add (at least) one!' % phase)
 
         for plugin in self.plugins(phase):
             # Abort this phase if one of the plugins disables it
@@ -375,16 +397,20 @@ class Task(object):
                 # pass method task, copy of config (so plugin cannot modify it)
                 args = (self, copy.copy(self.config.get(plugin.name)))
 
-            try:
-                fire_event('task.execute.before_plugin', self, plugin.name)
-                response = self.__run_plugin(plugin, phase, args)
-                if phase == 'input' and response:
-                    # add entries returned by input to self.all_entries
-                    for e in response:
-                        e.task = self
-                    self.all_entries.extend(response)
-            finally:
-                fire_event('task.execute.after_plugin', self, plugin.name)
+            # Hack to make task.session only active for a single plugin
+            with Session() as session:
+                self.session = session
+                try:
+                    fire_event('task.execute.before_plugin', self, plugin.name)
+                    response = self.__run_plugin(plugin, phase, args)
+                    if phase == 'input' and response:
+                        # add entries returned by input to self.all_entries
+                        for e in response:
+                            e.task = self
+                        self.all_entries.extend(response)
+                finally:
+                    fire_event('task.execute.after_plugin', self, plugin.name)
+                self.session = None
 
     def __run_plugin(self, plugin, phase, args=None, kwargs=None):
         """
@@ -437,7 +463,8 @@ class Task(object):
             self.abort(msg)
         except Exception as e:
             msg = 'BUG: Unhandled error in plugin %s: %s' % (keyword, e)
-            log.exception(msg)
+            log.critical(msg)
+            self.manager.crash_report()
             self.abort(msg)
 
     def rerun(self):
@@ -446,10 +473,6 @@ class Task(object):
         msg = 'Plugin %s has requested task to be ran again after execution has completed.' % self.current_plugin
         # Only print the first request for a rerun to the info log
         log.debug(msg) if self._rerun else log.info(msg)
-        if self._rerun_count >= self.max_reruns:
-            self._rerun = False
-            log.info('Task has been re-run %s times already, stopping for now' % self._rerun_count)
-            return
         self._rerun = True
 
     def config_changed(self):
@@ -459,29 +482,13 @@ class Task(object):
         """
         self.config_modified = True
 
-    @useTaskLogging
-    def execute(self):
-        """
-        Executes the the task.
-
-        If :attr:`.enabled` is False task is not executed. Certain :attr:`.options`
-        affect how execution is handled.
-
-        - :attr:`.options.disable_phases` is a list of phases that are not enabled
-          for this execution.
-        - :attr:`.options.inject` is a list of :class:`Entry` instances used instead
-          of running input phase.
-        """
+    def _execute(self):
+        """Executes the task without rerunning."""
         if not self.enabled:
             log.debug('Not running disabled task %s' % self.name)
-        if self.options.cron:
-            self.manager.db_cleanup()
-
-        self._reset()
-        log.debug('executing %s' % self.name)
-        if not self.enabled:
-            log.debug('task %s disabled during preparation, not running' % self.name)
             return
+
+        log.debug('executing %s' % self.name)
 
         # Handle keyword args
         if self.options.learn:
@@ -495,28 +502,26 @@ class Task(object):
             self.disable_phase('input')
             self.all_entries.extend(self.options.inject)
 
-        log.debug('starting session')
-        self.session = Session()
-
         # Save current config hash and set config_modidied flag
-        config_hash = hashlib.md5(str(sorted(self.config.items()))).hexdigest()
-        last_hash = self.session.query(TaskConfigHash).filter(TaskConfigHash.task == self.name).first()
-        if self.is_rerun:
-            # Restore the config to state right after start phase
-            if self.prepared_config:
-                self.config = copy.deepcopy(self.prepared_config)
+        with Session() as session:
+            config_hash = hashlib.md5(str(sorted(self.config.items()))).hexdigest()
+            last_hash = session.query(TaskConfigHash).filter(TaskConfigHash.task == self.name).first()
+            if self.is_rerun:
+                # Restore the config to state right after start phase
+                if self.prepared_config:
+                    self.config = copy.deepcopy(self.prepared_config)
+                else:
+                    log.error('BUG: No prepared_config on rerun, please report.')
+                self.config_modified = False
+            elif not last_hash:
+                self.config_modified = True
+                last_hash = TaskConfigHash(task=self.name, hash=config_hash)
+                session.add(last_hash)
+            elif last_hash.hash != config_hash:
+                self.config_modified = True
+                last_hash.hash = config_hash
             else:
-                log.error('BUG: No prepared_config on rerun, please report.')
-            self.config_modified = False
-        elif not last_hash:
-            self.config_modified = True
-            last_hash = TaskConfigHash(task=self.name, hash=config_hash)
-            self.session.add(last_hash)
-        elif last_hash.hash != config_hash:
-            self.config_modified = True
-            last_hash.hash = config_hash
-        else:
-            self.config_modified = False
+                self.config_modified = False
 
         # run phases
         try:
@@ -539,32 +544,50 @@ class Task(object):
                         # Store a copy of the config state after start phase to restore for reruns
                         self.prepared_config = copy.deepcopy(self.config)
         except TaskAbort:
-            # Roll back the session before calling abort handlers
-            self.session.rollback()
             try:
                 self.__run_task_phase('abort')
-                # Commit just the abort handler changes if no exceptions are raised there
-                self.session.commit()
             except TaskAbort as e:
                 log.exception('abort handlers aborted: %s' % e)
             raise
         else:
             for entry in self.all_entries:
                 entry.complete()
-            log.debug('committing session')
-            self.session.commit()
+
+    @use_task_logging
+    def execute(self):
+        """
+        Executes the the task.
+
+        If :attr:`.enabled` is False task is not executed. Certain :attr:`.options`
+        affect how execution is handled.
+
+        - :attr:`.options.disable_phases` is a list of phases that are not enabled
+          for this execution.
+        - :attr:`.options.inject` is a list of :class:`Entry` instances used instead
+          of running input phase.
+        """
+
+        try:
+            if self.options.cron:
+                self.manager.db_cleanup()
+            fire_event('task.execute.started', self)
+            while True:
+                self._execute()
+                # rerun task
+                if self._rerun and self._rerun_count < self.max_reruns:
+                    log.info('Rerunning the task in case better resolution can be achieved.')
+                    self._rerun_count += 1
+                    # TODO: Potential optimization is to take snapshots (maybe make the ones backlog uses built in
+                    # instead of taking another one) after input and just inject the same entries for the rerun
+                    self._all_entries = EntryContainer()
+                    self._rerun = False
+                    continue
+                elif self._rerun:
+                    log.info('Task has been re-run %s times already, stopping for now' % self._rerun_count)
+                break
             fire_event('task.execute.completed', self)
         finally:
-            # this will cause database rollback on exception
-            self.session.close()
-
-        # rerun task
-        if self._rerun:
-            log.info('Rerunning the task in case better resolution can be achieved.')
-            self._rerun_count += 1
-            # TODO: Potential optimization is to take snapshots (maybe make the ones backlog uses built in instead of
-            # taking another one) after input and just inject the same entries for the rerun
-            self.execute()
+            self.finished_event.set()
 
     @staticmethod
     def validate_config(config):
@@ -572,11 +595,6 @@ class Task(object):
         # Don't validate commented out plugins
         schema['patternProperties'] = {'^_': {}}
         return config_schema.process_config(config, schema)
-
-    def __eq__(self, other):
-        if hasattr(other, 'name'):
-            return self.name == other.name
-        return NotImplemented
 
     def __copy__(self):
         new = type(self)(self.manager, self.name, self.config, self.options)

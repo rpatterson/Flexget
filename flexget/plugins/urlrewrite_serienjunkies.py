@@ -13,7 +13,6 @@ log = logging.getLogger('serienjunkies')
 LANGUAGE = ['de', 'en', 'both']
 HOSTER = ['ul', 'cz', 'so']
 
-
 class UrlRewriteSerienjunkies(object):
 
     """
@@ -53,6 +52,7 @@ class UrlRewriteSerienjunkies(object):
         search_title = re.sub('\[.*\] ', '', download_title)
         self.config = task.config.get('serienjunkies')
         download_url = self.parse_download(series_url, search_title, self.config, entry)
+        #Debug Information
         log.debug('TV Show URL: %s' % series_url)
         log.debug('Episode: %s' % search_title)
         log.debug('Download URL: %s' % download_url)
@@ -88,10 +88,12 @@ class UrlRewriteSerienjunkies(object):
         # filter language
         if config['language'] in ['de', 'both']:
             if not re.search('german|deutsch', episode_lang, flags=re.IGNORECASE):
-                entry.reject('Language does not match')
-        if config['language'] in ['en', 'both']:
+                entry.reject('Language doesn\'t match selected')
+                return series_url
+        elif config['language'] in ['en', 'both']:
             if not re.search('englisc?h', episode_lang, flags=re.IGNORECASE):
-                entry.reject('Language does not match')
+                entry.reject('Language doesn\'t match selected')
+                return series_url
 
         # find download links
         links = episode.find_all('a')
@@ -108,9 +110,10 @@ class UrlRewriteSerienjunkies(object):
             if re.match(pattern, url):
                 return url
             else:
-                log.debug('Hoster does not match')
+                log.verbose('Hoster doesn\'t match selected')
                 continue
-
+        
+        raise UrlRewritingError('URL-Rewriting failed, enable verbose logging for details.')
 
 @event('plugin.register')
 def register_plugin():

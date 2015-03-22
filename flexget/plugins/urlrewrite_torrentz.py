@@ -14,7 +14,7 @@ from flexget.utils.bittorrent import MIRRORS
 
 log = logging.getLogger('torrentz')
 
-REGEXP = re.compile(r'http://torrentz\.(eu|me)/(?P<hash>[a-f0-9]{40})')
+REGEXP = re.compile(r'https?://torrentz\.(eu|me|ch|in)/(?P<hash>[a-f0-9]{40})')
 REPUTATIONS = {  # Maps reputation name to feed address
     'any': 'feed_any',
     'low': 'feed_low',
@@ -27,7 +27,7 @@ class UrlRewriteTorrentz(object):
     """Torrentz urlrewriter."""
 
     schema = {
-        'oneOf' : [
+        'oneOf': [
             {
                 'title': 'specify options',
                 'type': 'object',
@@ -57,13 +57,13 @@ class UrlRewriteTorrentz(object):
         entry['url'] = '%s%s.torrent' % (random.choice(MIRRORS), thash.upper())
         entry['torrent_info_hash'] = thash
 
-    def search(self, entry, config=None):
+    def search(self, task, entry, config=None):
         config = self.process_config(config)
         feed = REPUTATIONS[config['reputation']]
         entries = set()
-        for search_string in entry.get('search_string', [entry['title']]):
+        for search_string in entry.get('search_strings', [entry['title']]):
             query = normalize_unicode(search_string+config.get('extra_terms', ''))
-            for domain in ['eu', 'me']:
+            for domain in ['eu', 'me', 'ch', 'in']:
                 # urllib.quote will crash if the unicode string has non ascii characters, so encode in utf-8 beforehand
                 url = 'http://torrentz.%s/%s?q=%s' % (domain, feed, urllib.quote(query.encode('utf-8')))
                 log.debug('requesting: %s' % url)
@@ -73,13 +73,15 @@ class UrlRewriteTorrentz(object):
                 except requests.RequestException as err:
                     log.warning('torrentz.%s failed. Error: %s' % (domain, err))
             else:
-                raise plugin.PluginWarning('Error getting torrentz search results')
+                raise plugin.PluginError('Error getting torrentz search results')
+
+            if not r.content.strip():
+                raise plugin.PluginError('No data from %s. Maybe torrentz is blocking the FlexGet User-Agent' % url)
 
             rss = feedparser.parse(r.content)
 
-            ex = rss.get('bozo_exception', False)
-            if ex:
-                raise plugin.PluginWarning('Got bozo_exception (bad feed)')
+            if rss.get('bozo_exception'):
+                raise plugin.PluginError('Got bozo_exception (bad rss feed)')
 
             for item in rss.entries:
                 m = re.search(r'Size: ([\d]+) Mb Seeds: ([,\d]+) Peers: ([,\d]+) Hash: ([a-f0-9]+)',

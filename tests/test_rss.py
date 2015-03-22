@@ -1,7 +1,7 @@
 from __future__ import unicode_literals, division, absolute_import
 import yaml
-from tests import FlexGetBase
-from nose.plugins.attrib import attr
+
+from tests import FlexGetBase, use_vcr
 
 
 class TestInputRSS(FlexGetBase):
@@ -34,6 +34,12 @@ class TestInputRSS(FlexGetBase):
           test_all_entries_yes:
             rss:
               all_entries: yes
+          test_field_sanitation:
+            rss:
+              link: "other:link"
+              title: "other:Title"
+              other_fields:
+              - "Other:field"
     """
 
     def test_rss(self):
@@ -125,6 +131,13 @@ class TestInputRSS(FlexGetBase):
         self.execute_task('test_all_entries_yes')
         assert self.task.entries, 'Entries should have been produced on second run.'
 
+    def test_field_sanitation(self):
+        self.execute_task('test_field_sanitation')
+        entry = self.task.entries[0]
+        assert entry['title'] == 'alt title'
+        assert entry['url'] == 'http://localhost/altlink'
+        assert entry['other:field'] == 'otherfield'
+
 
 class TestRssOnline(FlexGetBase):
 
@@ -150,7 +163,7 @@ class TestRssOnline(FlexGetBase):
 
     """
 
-    @attr(online=True)
+    @use_vcr
     def test_rss_online(self):
         # Make sure entries are created for all test tasks
         tasks = yaml.load(self.__yaml__)['tasks']

@@ -13,11 +13,11 @@ from flexget.utils.search import torrent_availability, normalize_unicode
 
 log = logging.getLogger('piratebay')
 
-CUR_TLD = "se"
-TLDS = "com|org|sx|ac|pe|gy|%s" % CUR_TLD
+CUR_TLD = 'se'
+TLDS = 'com|org|sx|ac|pe|gy|se|%s' % CUR_TLD
 
-URL_MATCH = re.compile("^http://(?:torrents\.)?thepiratebay\.(?:%s)/.*$" % TLDS)
-URL_SEARCH = re.compile("^http://thepiratebay\.(?:%s)/search/.*$" % TLDS)
+URL_MATCH = re.compile('^http://(?:torrents\.)?thepiratebay\.(?:%s)/.*$' % TLDS)
+URL_SEARCH = re.compile('^http://thepiratebay\.(?:%s)/search/.*$' % TLDS)
 
 CATEGORIES = {
     'all': 0,
@@ -77,7 +77,7 @@ class UrlRewritePirateBay(object):
             log.debug("Got the URL: %s" % entry['url'])
         if URL_SEARCH.match(entry['url']):
             # use search
-            results = self.search(entry)
+            results = self.search(task, entry)
             if not results:
                 raise UrlRewritingError("No search results found")
             # TODO: Close matching was taken out of search methods, this may need to be fixed to be more picky
@@ -88,7 +88,7 @@ class UrlRewritePirateBay(object):
 
     @plugin.internet(log)
     def parse_download_page(self, url):
-        page = requests.get(url).content
+        page = requests.get(url,verify=False).content
         try:
             soup = get_soup(page)
             tag_div = soup.find('div', attrs={'class': 'download'})
@@ -104,7 +104,7 @@ class UrlRewritePirateBay(object):
             raise UrlRewritingError(e)
 
     @plugin.internet(log)
-    def search(self, arg_entry, config=None):
+    def search(self, task, entry, config=None):
         """
         Search for name from piratebay.
         """
@@ -120,14 +120,14 @@ class UrlRewritePirateBay(object):
         filter_url = '/0/%d/%d' % (sort, category)
 
         entries = set()
-        for search_string in arg_entry.get('search_string', [arg_entry['title']]):
+        for search_string in entry.get('search_strings', [entry['title']]):
             query = normalize_unicode(search_string)
             # TPB search doesn't like dashes
             query = query.replace('-', ' ')
             # urllib.quote will crash if the unicode string has non ascii characters, so encode in utf-8 beforehand
             url = 'http://thepiratebay.%s/search/%s%s' % (CUR_TLD, urllib.quote(query.encode('utf-8')), filter_url)
             log.debug('Using %s as piratebay search url' % url)
-            page = requests.get(url).content
+            page = requests.get(url,verify=False).content
             soup = get_soup(page)
             for link in soup.find_all('a', attrs={'class': 'detLink'}):
                 entry = Entry()
