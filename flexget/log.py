@@ -13,6 +13,10 @@ from typing import Iterator
 
 import loguru
 from loguru import logger
+try:
+    import servicelogging
+except ImportError:
+    servicelogging = None
 
 from flexget import __version__
 from flexget.utils.tools import io_encoding
@@ -73,6 +77,13 @@ class InterceptHandler(logging.Handler):
     """Catch any stdlib log messages from our deps and propagate to loguru."""
 
     def emit(self, record: logging.LogRecord):
+        """
+        Catch any stdlib log messages from our deps and propagate to loguru.
+        """
+        if getattr(record, "_from_loguru", False):
+            # Skip records already propagated from logugu
+            return
+
         # Get corresponding Loguru level if it exists
         try:
             level = logger.level(record.levelname).name
@@ -85,9 +96,27 @@ class InterceptHandler(logging.Handler):
             frame = frame.f_back
             depth += 1
 
+        record._from_logging = True
         logger.bind(name=record.name).opt(depth=depth, exception=record.exc_info).log(
             level, record.getMessage()
         )
+
+
+class PropagateHandler(logging.Handler):
+    """
+    Send loguru messages through the standard library logging system.
+    """
+
+    def emit(self, record):
+        """
+        Send loguru messages through the standard library logging system.
+        """
+        if getattr(record, "_from_logging", False):
+            # Skip records already intercepted from logging
+            return
+
+        record._from_loguru = True
+        logging.getLogger(record.name).handle(record)
 
 
 _logging_configured = False
@@ -157,6 +186,8 @@ def start(
     if level == 'NONE':
         return
 
+    logger.add(PropagateHandler(), format="{message}")
+
     # Make sure stdlib logger is set so that dependency logging gets propagated
     logging.getLogger().setLevel(logger.level(level).no)
 
@@ -172,6 +203,13 @@ def start(
 
     # without --cron we log to console
     if to_console:
+        if servicelogging and not sys.stderr.isatty():
+            servicelogging.add_loguru_level_names()
+            handler = servicelogging.choose_handler()
+            handler.setFormatter(logging.Formatter(
+                fmt=servicelogging.SYSLOG_PREFIX + '%(task)-15s %(message)s'))
+            logger.add(handler)
+
         if not sys.stdout:
             logger.debug("No sys.stdout, can't log to console.")
         else:
