@@ -12,6 +12,11 @@ import uuid
 import warnings
 import os
 
+try:
+    import servicelogging
+except ImportError:
+    servicelogging = None
+
 from flexget import __version__
 from flexget.utils.tools import io_encoding
 
@@ -139,10 +144,13 @@ class FlexGetLogger(logging.Logger):
 class FlexGetFormatter(logging.Formatter):
     """Custom formatter that can handle both regular log records and those created by FlexGetLogger"""
 
-    flexget_fmt = '%(asctime)-15s %(levelname)-8s %(name)-13s %(task)-15s %(message)s'
+    message_fmt = '%(levelname)-8s %(name)-13s %(task)-15s %(message)s'
+    flexget_fmt = '%(asctime)-15s ' + message_fmt
 
-    def __init__(self):
-        logging.Formatter.__init__(self, self.flexget_fmt, '%Y-%m-%d %H:%M')
+    def __init__(self, fmt=None):
+        if fmt is None:
+            fmt = self.flexget_fmt
+        logging.Formatter.__init__(self, fmt, '%Y-%m-%d %H:%M')
 
     def format(self, record):
         if not hasattr(record, 'task'):
@@ -215,18 +223,23 @@ def start(filename=None, level=logging.INFO, to_console=True, to_file=True):
         file_handler.setLevel(level)
         logger.addHandler(file_handler)
 
-    # without --cron we log to console
     if to_console:
-        # Make sure we don't send any characters that the current terminal doesn't support printing
-        stdout = sys.stdout
-        if hasattr(stdout, 'buffer'):
-            # On python 3, we need to get the buffer directly to support writing bytes
-            stdout = stdout.buffer
-        safe_stdout = codecs.getwriter(io_encoding)(stdout, 'replace')
-        console_handler = logging.StreamHandler(safe_stdout)
-        console_handler.setFormatter(formatter)
-        console_handler.setLevel(level)
-        logger.addHandler(console_handler)
+        if servicelogging and not sys.stderr.isatty():
+            handler = servicelogging.choose_handler()
+            handler.setFormatter(FlexGetFormatter(
+                fmt=servicelogging.SYSLOG_PREFIX + FlexGetFormatter.message_fmt))
+            logger.addHandler(handler)
+        else:
+            # without --cron we log to console
+            stdout = sys.stdout
+            if hasattr(stdout, 'buffer'):
+                # On python 3, we need to get the buffer directly to support writing bytes
+                stdout = stdout.buffer
+            safe_stdout = codecs.getwriter(io_encoding)(stdout, 'replace')
+            console_handler = logging.StreamHandler(safe_stdout)
+            console_handler.setFormatter(formatter)
+            console_handler.setLevel(level)
+            logger.addHandler(console_handler)
 
     # flush what we have stored from the plugin initialization
     logger.removeHandler(_buff_handler)
