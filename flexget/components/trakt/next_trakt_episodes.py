@@ -108,7 +108,12 @@ class NextTraktEpisodes(object):
                 raise plugin.PluginError(
                     'An error has occurred looking up: Trakt_id: %s Error: %s' % (trakt_id, e)
                 )
-            if context == 'aired':
+            if (
+                    config['position'] == 'next' and
+                    data['completed'] == data['aired']):
+                # Don't emit anything when there's nothing next to collect/watch
+                continue
+            elif context == 'aired':
                 eps = data['season']
                 epn = data['number']
             elif config['position'] == 'next' and data.get('next_episode'):
