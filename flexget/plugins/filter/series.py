@@ -1045,13 +1045,6 @@ def set_series_begin(series, ep_id):
         # Need to flush to get an id on new Episode before assigning it as series begin
         session.flush()
     series.begin = episode
-    # Mark any releases for the begin episode or later as not downloaded.
-    for release in session.query(EpisodeRelease).join(Episode).filter(
-            Episode.series_id == series.id).filter(
-                EpisodeRelease.downloaded == True).filter(
-                    Episode.season >= episode.season).filter(
-                        Episode.number >= episode.number):
-        release.downloaded = False
     return (identified_by, entity_type)
 
 
