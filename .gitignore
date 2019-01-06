@@ -2,6 +2,8 @@
 *.pyc
 *.swo
 *.swp
+.eggs/
+.tox/
 .settings/
 .project
 .pydevproject

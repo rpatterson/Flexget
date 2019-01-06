@@ -40,9 +40,12 @@ setup(
     packages=find_packages(exclude=['flexget.tests']),
     include_package_data=True,
     zip_safe=False,
+    setup_requires=['pytest-runner'],
     install_requires=load_requirements('requirements.txt'),
-    tests_require=['pytest'],
-    extras_require={'dev': load_requirements('dev-requirements.txt')},
+    tests_require=load_requirements('dev-requirements.txt'),
+    extras_require={
+        'dev': load_requirements('dev-requirements.txt')
+    },
     entry_points={
         'console_scripts': ['flexget = flexget:main'],
         'gui_scripts': [
