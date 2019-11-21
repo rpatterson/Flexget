@@ -98,7 +98,8 @@ class SearchRarBG:
                     params={'get_token': 'get_token', 'format': 'json', 'app_id': 'flexget'},
                 ).json()
                 self.token = response.get('token')
-                logger.debug('RarBG token: {}', self.token)
+                logger.debug('RarBG token: %s', self.token)
+                requests.domain_limiters['torrentapi.org']()
             except RequestException as e:
                 logger.opt(exception=True).debug('Could not retrieve RarBG token')
                 raise PluginError('Could not retrieve token: %s' % e)
