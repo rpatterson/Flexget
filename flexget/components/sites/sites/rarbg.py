@@ -116,10 +116,14 @@ class SearchRarBG:
         params['token'] = self.get_token(refresh=token_error)
         try:
             response = requests.get(self.base_url, params=params)
-            logger.debug('requesting: {}', response.url)
+            logger.debug('requesting: %s', response.url)
             response = response.json()
         except RequestException as e:
-            logger.error('Rarbg request failed: {}', e)
+            logger.error('Rarbg request failed, will try again: %s', e)
+            try:
+                response = requests.get(self.base_url, params=params)
+            except RequestException as e:
+                logger.error('Rarbg request failed, giving up: %s', e)
             return
 
         # error code 1, 2 and 4 pertain to token errors
