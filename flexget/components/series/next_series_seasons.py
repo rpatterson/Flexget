@@ -227,6 +227,8 @@ class NextSeriesSeasons:
                         'season lookup produced an episode result; assuming no season match, no need to rerun'
                     )
                     return
+                elif getattr(latest, "season", None) is None:
+                    logger.error("No season available for latest episode {}", latest)
                 else:
                     logger.debug(
                         '{} {} was accepted, rerunning to look for next season.',
